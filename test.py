@@ -140,6 +140,8 @@ class RobotHandler(Node):
         self.y_goal_velocity = 0.0
         self.yaw_goal_velocity = 0.0
 
+        # robot side order: fr(hip, thigh, knee), fl(hip, thigh, knee), rr(hip, thigh, knee), rl(hip, thigh, knee).
+        # policy side order: hip(fl, fr, rl, rr), thigh(fl, fr, rl, rr), knee(fl, fr, rl, rr)
         self.obs_reorder_mask = [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
         self.action_reorder_mask = [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
 
@@ -148,7 +150,9 @@ class RobotHandler(Node):
         self.control_mode = None
 
         self.joint_ids_to_lock = [] # Put the joint ids that you want to lock here
-        self.hard_locked_factor = 0.2
+        self.hard_locked_factor = 0.0
+        # self.joint_ids_to_lock = [3, 4, 5] # Put the joint ids that you want to lock here
+        # self.hard_locked_factor = 0.1
         self.joint_limits = np.array([
             [-1.0472,   1.0472 ],
             [-1.5708,   3.4907 ],
@@ -170,7 +174,7 @@ class RobotHandler(Node):
         self.high_p_gain = np.ones(12) * 60.0
         self.high_d_gain = np.ones(12) * 1.0
 
-        self.load_policy("2025-11-23_23-56-25_model_5999.pt")
+        self.load_policy("2025-11-21_01-36-14_model_5999.pt")
 
         print(f"Robot ready. Model running on {jax.default_backend()}.")
 
@@ -273,46 +277,12 @@ class RobotHandler(Node):
         self.publisher.publish(low_cmd)
 
     def construct_go2_observation(self, qpos, qvel, previous_action, trunk_angular_velocity, goal_velocities, projected_gravity_vector):
-                dynamic_joint_observations = np.empty(0)
-                for i in range(12):
-                    desc_vector = np.concatenate([
-                    (self.relative_joint_position_normalized[i, :] / 0.5) - 1.0,
-                    self.relative_joint_axis_local[i, :],
-                    np.array([self.joint_nominal_positions[i]]) / 4.6,
-                    (np.array([self.desc_joint_max_torque[i]]) / 500.0) - 1.0,
-                    (np.array([self.joint_max_velocity[i]]) / 17.5) - 1.0,
-                    np.array([self.desc_joint_lower_limits[i]]),
-                    np.array([self.desc_joint_upper_limits[i]]),
-                    ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
-                    (self.desc_mass / 85.0) - 1.0,
-                    (self.robot_dimensions / 1.0) - 1.0,
-                    ])
-                    
-                    current_observation = np.concatenate((desc_vector, np.array([qpos[i]]), np.array([qvel[i]]), np.array([previous_action[i]])))
-                    dynamic_joint_observations = np.concatenate((dynamic_joint_observations, current_observation))
-                
-                observation = np.concatenate([
-                    dynamic_joint_observations,
-                    np.clip(trunk_angular_velocity / 50.0, -10.0, 10.0),
-                    goal_velocities,
-                    projected_gravity_vector,
-                    ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
-                    (self.desc_mass / 85.0) - 1.0,
-                    ((self.robot_dimensions / 1.0) - 1.0),
-                    (self.nr_joints / 15.0 - 1.0),
-                    self.scaled_foot_size
-                ])
-                
-                return observation
+        """
+        Construct the one policy observation for Go2 robot from both onboard observation and static embodiment parameters.
+        The joint order is in policy side order.
+        """
         
-    def nn(self):
-        # Only run neural network if it's already running or if the robot is standing up
-        if self.last_seen_control_mode != "nn" and self.last_seen_control_mode != "stand_up":
-            return
-        
-        if self.last_seen_control_mode != "nn":
-            self.previous_action = np.zeros(12)
-        
+        # dynamic joint description invariant elements
         self.relative_joint_position_normalized = np.array([
                                                     [0.9258, 0.6198, 0.8478],
                                                     [0.9258, 0.3802, 0.8478],
@@ -344,7 +314,57 @@ class RobotHandler(Node):
         self.joint_max_velocity = np.array([30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30.])
         self.desc_joint_lower_limits = np.array([-1.0500, -1.0500, -1.0500, -1.0500, -1.5700, -1.5700, -0.5200, -0.5200, -2.7200, -2.7200, -2.7200, -2.7200])
         self.desc_joint_upper_limits = np.array([ 1.0500,  1.0500,  1.0500,  1.0500,  3.4900,  3.4900,  4.5300,  4.5300, -0.8400, -0.8400, -0.8400, -0.8400])
+        # self.desc_joint_lower_limits = np.array([-0.0150, -1.0500, -1.0500, -1.0500,  0.5630, -1.5700, -0.5200, -0.5200, -1.6220, -2.7200, -2.7200, -2.7200]) # lock fl to 0.1
+        # self.desc_joint_upper_limits = np.array([ 0.1950,  1.0500,  1.0500,  1.0500,  1.0690,  3.4900,  4.5300,  4.5300, -1.4340, -0.8400, -0.8400, -0.8400]) # lock fl to 0.1
 
+        # general policy state invariant 11 elements
+        self.gains_and_action_scaling_factor = np.array([20.0000,  0.5000,  0.3000])
+        self.desc_mass = np.array([15.017])
+        self.robot_dimensions = np.array([0.6196, 0.3902, 0.3835])
+        self.nr_joints = np.array([12])
+        self.scaled_foot_size = np.array([-0.8240, -0.8240, -0.8240])
+        
+        dynamic_joint_observations = np.empty(0)
+        for i in range(12):
+            desc_vector = np.concatenate([
+            (self.relative_joint_position_normalized[i, :] / 0.5) - 1.0,
+            self.relative_joint_axis_local[i, :],
+            np.array([self.joint_nominal_positions[i]]) / 4.6,
+            (np.array([self.desc_joint_max_torque[i]]) / 500.0) - 1.0,
+            (np.array([self.joint_max_velocity[i]]) / 17.5) - 1.0,
+            np.array([self.desc_joint_lower_limits[i]]),
+            np.array([self.desc_joint_upper_limits[i]]),
+            ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
+            (self.desc_mass / 85.0) - 1.0,
+            (self.robot_dimensions / 1.0) - 1.0,
+            ])
+            
+            current_observation = np.concatenate((desc_vector, np.array([qpos[i]]), np.array([qvel[i]]), np.array([previous_action[i]])))
+            dynamic_joint_observations = np.concatenate((dynamic_joint_observations, current_observation))
+        
+        observation = np.concatenate([
+            dynamic_joint_observations,
+            np.clip(trunk_angular_velocity / 50.0, -10.0, 10.0),
+            goal_velocities,
+            projected_gravity_vector,
+            ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
+            (self.desc_mass / 85.0) - 1.0,
+            ((self.robot_dimensions / 1.0) - 1.0),
+            (self.nr_joints / 15.0 - 1.0),
+            self.scaled_foot_size
+        ])
+        
+        return observation
+        
+    def nn(self):
+        # Only run neural network if it's already running or if the robot is standing up
+        if self.last_seen_control_mode != "nn" and self.last_seen_control_mode != "stand_up":
+            return
+        
+        if self.last_seen_control_mode != "nn":
+            self.previous_action = np.zeros(12)
+
+        # dynamic joint state
         qpos = (self.joint_positions - self.nominal_joint_positions) / 4.6
         qpos = qpos[self.obs_reorder_mask]
 
@@ -354,18 +374,11 @@ class RobotHandler(Node):
         previous_action = self.previous_action / 10.0
         previous_action = previous_action[self.obs_reorder_mask]
         
-        # 9 elements
+        # general policy state variant 9 elements
         trunk_angular_velocity = self.angular_velocity
         goal_velocities = np.array([self.x_goal_velocity, self.y_goal_velocity, self.yaw_goal_velocity])
         orientation_quat_inv = R.from_quat(self.orientation).inv()
         projected_gravity_vector = orientation_quat_inv.apply(np.array([0.0, 0.0, -1.0]))
-
-        # 11 elements
-        self.gains_and_action_scaling_factor = np.array([20.0000,  0.5000,  0.3000])
-        self.desc_mass = np.array([15.017])
-        self.robot_dimensions = np.array([0.6196, 0.3902, 0.3835])
-        self.nr_joints = np.array([12])
-        self.scaled_foot_size = np.array([-0.8240, -0.8240, -0.8240])
         
         observation = self.construct_go2_observation(qpos, qvel, previous_action, trunk_angular_velocity, goal_velocities, projected_gravity_vector)
         observation = torch.from_numpy(observation).float()
@@ -390,7 +403,7 @@ class RobotHandler(Node):
         p_gains[self.joint_ids_to_lock] = np.where(hard_out_of_limits, self.high_p_gain[self.joint_ids_to_lock], p_gains[self.joint_ids_to_lock])
         d_gains[self.joint_ids_to_lock] = np.where(hard_out_of_limits, self.high_d_gain[self.joint_ids_to_lock], d_gains[self.joint_ids_to_lock])
 
-        # target_joint_positions[self.joint_ids_to_lock] = np.clip(target_joint_positions[self.joint_ids_to_lock], self.hard_joint_lower_limits[self.joint_ids_to_lock], self.hard_joint_upper_limits[self.joint_ids_to_lock])
+        target_joint_positions[self.joint_ids_to_lock] = np.clip(target_joint_positions[self.joint_ids_to_lock], self.hard_joint_lower_limits[self.joint_ids_to_lock], self.hard_joint_upper_limits[self.joint_ids_to_lock])
 
         low_cmd = deepcopy(self.default_low_cmd)
         for i in range(12):
