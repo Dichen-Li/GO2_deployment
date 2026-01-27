@@ -1,73 +1,357 @@
+#!/usr/bin/env python3
+"""
+GO2 deployment with URMA expert policy + online adaptation injection (CPU).
+
+Key requirements satisfied:
+- RobotHandler remains the ONLY real-robot I/O interface (ROS2 subscriptions/publishing).
+- Keep original deployment code behavior for:
+  - observation retrieval
+  - action sending (LowCmd publishing)
+  - hard joint locking / clamping logic (kept exactly)
+- Add adaptation with minimal intrusion:
+  RobotHandler.nn() builds the same raw observation as before, then calls a runner:
+    runner.step(obs) does:
+      1) update_predictions (from past history)
+      2) inject predictions (if ready)
+      3) compute action
+      4) add_history (state, action, cmd_vel) for next prediction
+- No sim-style reset/respawn flags.
+
+YOU MUST IMPLEMENT (placeholders):
+- DeploymentAdaptationModule._build_model()
+- DeploymentAdaptationModule.load_checkpoint(...)
+- DeploymentAdaptationModule._forward_model(...)
+"""
+
 import os
-import shutil
-import json
-import onnx
+import time
 from copy import deepcopy
+from types import SimpleNamespace
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-import jax
-import jax.numpy as jnp
-from flax.training.train_state import TrainState
-from flax.training import orbax_utils
-import orbax.checkpoint
-import optax
+
+import torch
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 
 from unitree_go.msg import LowState, LowCmd, WirelessController
-
-from crc_module import get_crc
-
 from unitree_sdk2py.go2.robot_state.robot_state_client import RobotStateClient
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
-import torch
-from types import SimpleNamespace
-
+from crc_module import get_crc
 from policy import get_policy
 
-def one_policy_observation_to_inputs(one_policy_observation, metadata):
+
+# -------------------------
+# Shared parsing function
+# -------------------------
+def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metadata: SimpleNamespace):
     """
-        Transform one policy observation into 5 inputs that a one policy model accept
-        Args:
-            one_policy_observation (tensor): The one policy observation. eg. For GenDog1, the size is 340 on the last dimension.
-            meta: could be anything that provide the metadata of robot joint and foot numbers. By default, pass in env.unwrapped.
-            device: 
-        """
-    # Dynamic Joint Observations
+    EXACTLY matches your original parsing logic.
+
+    Returns:
+      dynamic_joint_description: (J, 18)
+      dynamic_joint_state      : (J,  3)  [qpos, qvel, prev_action]
+      general_policy_state     : (20,)    [9 + last11]
+    """
     nr_dynamic_joint_observations = metadata.nr_dynamic_joint_observations
     single_dynamic_joint_observation_length = metadata.single_dynamic_joint_observation_length
     dynamic_joint_observation_length = metadata.dynamic_joint_observation_length
     dynamic_joint_description_size = metadata.dynamic_joint_description_size
-    dynamic_joint_combined_state = one_policy_observation[..., :dynamic_joint_observation_length].view((*one_policy_observation.shape[:-1], nr_dynamic_joint_observations, single_dynamic_joint_observation_length))
+
+    dynamic_joint_combined_state = one_policy_observation[..., :dynamic_joint_observation_length].view(
+        (*one_policy_observation.shape[:-1], nr_dynamic_joint_observations, single_dynamic_joint_observation_length)
+    )
     dynamic_joint_description = dynamic_joint_combined_state[..., :dynamic_joint_description_size]
     dynamic_joint_state = dynamic_joint_combined_state[..., dynamic_joint_description_size:]
 
     trunk_angular_vel_update_obs_idx = metadata.trunk_angular_vel_update_obs_idx
     goal_velocity_update_obs_idx = metadata.goal_velocity_update_obs_idx
     projected_gravity_update_obs_idx = metadata.projected_gravity_update_obs_idx
-    general_policy_state = one_policy_observation[..., trunk_angular_vel_update_obs_idx+goal_velocity_update_obs_idx+projected_gravity_update_obs_idx]
+
+    general_policy_state = one_policy_observation[
+        ..., trunk_angular_vel_update_obs_idx + goal_velocity_update_obs_idx + projected_gravity_update_obs_idx
+    ]
     GENERAL_POLICY_STATE_LEN = 11
-    general_policy_state = torch.cat((general_policy_state, one_policy_observation[..., -GENERAL_POLICY_STATE_LEN:]), dim=-1) # gains_and_action_scaling_factor; mass; robot_dimensions
-
-    inputs = (
-        dynamic_joint_description,
-        dynamic_joint_state,
-        general_policy_state
+    general_policy_state = torch.cat(
+        (general_policy_state, one_policy_observation[..., -GENERAL_POLICY_STATE_LEN:]), dim=-1
     )
-    return inputs
 
+    return dynamic_joint_description, dynamic_joint_state, general_policy_state
+
+
+# ----------------------------------------
+# Deployment Adaptation Module (single env)
+# ----------------------------------------
+class DeploymentAdaptationModule:
+    """
+    Single-robot adaptation module:
+    - maintains history (state, action, cmd_vel) of length W
+    - periodically predicts normalized description entries
+    - stores predictions + has_prediction flag
+
+    Placeholder model parts are left for you.
+    """
+
+    def __init__(self, window_length: int = 20, adaptation_freq: int = 1, num_joints: int = 12, device="cpu"):
+        self.W = int(window_length)
+        self.adaptation_freq = int(adaptation_freq)
+        self.J = int(num_joints)
+        self.device = torch.device(device)
+
+        # History on CPU (stable)
+        self.state_hist = torch.zeros((1, self.W, self.J, 3), device="cpu")   # (1,W,J,3)
+        self.target_hist = torch.zeros((1, self.W, self.J, 1), device="cpu")  # (1,W,J,1)
+        self.cmdvel_hist = torch.zeros((1, self.W, 3), device="cpu")          # (1,W,3)
+        self.hist_idx = 0
+
+        # Predictions in normalized space (on self.device)
+        self.has_prediction = False
+        self.joint_range_pred = torch.zeros((1, self.J, 2), device=self.device)  # desc[:, 9:11]
+        self.mass_desc_pred = torch.zeros((1, self.J, 1), device=self.device)    # desc[:, 14:15]
+        self.mass_gps_pred = torch.zeros((1, 1), device=self.device)             # gps mass (index 12)
+
+        self._step = 0
+        self.model = self._build_model()
+
+    # -------- YOU implement these 3 ----------
+    def _build_model(self):
+        """
+        Return a torch.nn.Module that matches your sim adaptation model:
+          model(state_seq, target_seq, cmdvel_seq) ->
+              dynamic_joint_description_pred: (B,J,>=15)
+              invariant_general_policy_state_pred: (B, >=4)
+        """
+        import model2
+        model = model2.get_policy(self.W, self.device)
+        return model
+
+    def load_checkpoint(self, ckpt_path: str):
+        """
+        Load adaptation checkpoint into self.model.
+        """
+        adaptation_state = torch.load(ckpt_path, map_location=self.device)
+        # Try loading directly first, then try with "model_state_dict" key if that fails
+        try:
+            self.model.load_state_dict(adaptation_state)
+        except:
+            self.model.load_state_dict(adaptation_state["model_state_dict"])
+        self.model.to(self.device)
+        self.model.eval()
+        print(f"[INFO] Adaptation checkpoint loaded from {ckpt_path}")
+        return
+
+    def _forward_model(self, state_seq: torch.Tensor, target_seq: torch.Tensor, cmdvel_seq: torch.Tensor):
+        """
+        Run the adaptation model forward and return:
+          dynamic_joint_description_pred, invariant_general_policy_state_pred
+        """
+        with torch.no_grad():
+            return self.model(state_seq, target_seq, cmdvel_seq)
+    # -----------------------------------------
+
+    def reset(self):
+        self.state_hist.zero_()
+        self.target_hist.zero_()
+        self.cmdvel_hist.zero_()
+        self.hist_idx = 0
+        self.has_prediction = False
+        self._step = 0
+
+    def add_history(self, state: torch.Tensor, action: torch.Tensor, cmd_vel: torch.Tensor):
+        """
+        Add NEW sample to history (for NEXT step prediction).
+
+        state:  (1,J,3)  dynamic_joint_state
+        action: (1,J) or (1,J,1)
+        cmd_vel:(1,3)
+        """
+        state_cpu = state.detach().to("cpu")
+        action_cpu = action.detach().to("cpu")
+        cmd_cpu = cmd_vel.detach().to("cpu")
+
+        if action_cpu.dim() == 2:
+            action_cpu = action_cpu.unsqueeze(-1)  # (1,J,1)
+
+        if self.hist_idx < self.W:
+            self.state_hist[0, self.hist_idx] = state_cpu[0]
+            self.target_hist[0, self.hist_idx] = action_cpu[0]
+            self.cmdvel_hist[0, self.hist_idx] = cmd_cpu[0]
+            self.hist_idx += 1
+        else:
+            # shift (simple & stable)
+            self.state_hist[0, :-1] = self.state_hist[0, 1:].clone()
+            self.target_hist[0, :-1] = self.target_hist[0, 1:].clone()
+            self.cmdvel_hist[0, :-1] = self.cmdvel_hist[0, 1:].clone()
+            self.state_hist[0, -1] = state_cpu[0]
+            self.target_hist[0, -1] = action_cpu[0]
+            self.cmdvel_hist[0, -1] = cmd_cpu[0]
+
+    def update_predictions(self):
+        """
+        Step order requirement: call this at the START of each control tick.
+
+        If history full and due, run model and update:
+          - joint_range_pred (desc[:,9:11])  lower/upper
+          - mass_desc_pred   (desc[:,14:15])
+          - mass_gps_pred    (gps mass from invariant head index 3:4 -> mapped to gps[12])
+        """
+        self._step += 1
+        due = (self._step % self.adaptation_freq == 0)
+        ready = (self.hist_idx >= self.W)
+
+        if (not ready) or (not due):
+            return
+
+        if self.model is None:
+            return
+
+        state_seq = self.state_hist.to(self.device)   # (1,W,J,3)
+        target_seq = self.target_hist.to(self.device) # (1,W,J,1)
+        cmdvel_seq = self.cmdvel_hist.to(self.device) # (1,W,3)
+
+        dynamic_joint_description_pred, invariant_general_policy_state_pred = \
+            self._forward_model(state_seq, target_seq, cmdvel_seq)
+
+        # Same indexing contract as sim:
+        self.joint_range_pred[...] = dynamic_joint_description_pred[:, :, 9:11]
+        self.mass_desc_pred[...] = dynamic_joint_description_pred[:, :, 14:15]
+        self.mass_gps_pred[...] = invariant_general_policy_state_pred[:, 3:4]
+
+        self.has_prediction = True
+
+
+# ---------------------------------------------------
+# URMA + Adaptation runner for deployment (single env)
+# ---------------------------------------------------
+class DeploymentUrmaAdaptationRunner:
+    """
+    Keeps adaptation logic isolated from RobotHandler I/O.
+
+    Per-step order:
+      1) update_predictions (from past history)
+      2) inject predictions
+      3) compute action
+      4) add_history (state, action, cmd_vel) for next prediction
+    """
+
+    def __init__(
+        self,
+        policy: torch.nn.Module,
+        metadata: SimpleNamespace,
+        window_length: int = 20,
+        adaptation_freq: int = 1,
+        enable_adaptation: bool = True,
+        verbose: bool = True,
+        device: str = "cpu",
+    ):
+        self.device = torch.device(device)
+        self.policy = policy.to(self.device).eval()
+        self.metadata = metadata
+
+        self.enable_adaptation = bool(enable_adaptation)
+        self.verbose = bool(verbose)
+
+        self.adaptation = None
+        if self.enable_adaptation:
+            self.adaptation = DeploymentAdaptationModule(
+                window_length=window_length,
+                adaptation_freq=adaptation_freq,
+                num_joints=metadata.nr_dynamic_joint_observations,
+                device=device,
+            )
+
+        self._printed_active = False
+        self.global_step = 0
+
+    def load_adaptation_checkpoint(self, ckpt_path: str):
+        if self.adaptation is None:
+            return
+        self.adaptation.load_checkpoint(ckpt_path)
+
+    def step(self, one_policy_observation: torch.Tensor):
+        """
+        one_policy_observation: torch.float32, shape (obs_dim,)
+        Returns:
+          action: (12,) torch
+          debug: dict
+        """
+        one_policy_observation = one_policy_observation.to(self.device)
+
+        # Parse
+        desc_gt, state, gps = one_policy_observation_to_inputs(one_policy_observation, self.metadata)
+
+        # 1) Update predictions FIRST (based on previous history)
+        if self.enable_adaptation and (self.adaptation is not None):
+            self.adaptation.update_predictions()
+
+        # 2) Inject (if has prediction)
+        desc_used = desc_gt.clone()
+        gps_used = gps.clone()
+
+        has_pred = False
+        cmd_vel = gps[3:6]  # goal velocities
+        if self.enable_adaptation and (self.adaptation is not None) and self.adaptation.has_prediction and cmd_vel.norm() > 0.1:
+            has_pred = True
+
+            # joint_range1=lower, joint_range2=upper  -> desc[:,9:11]
+            # desc_used[:, 9:11] = self.adaptation.joint_range_pred[0]
+            # mass in desc -> desc[:,14:15]
+            desc_used[:, 14:15] = self.adaptation.mass_desc_pred[0]
+            # mass in gps -> gps[12] (since gps = [9] + [last11], mass sits at index 12)
+            gps_used[12:13] = self.adaptation.mass_gps_pred[0]
+
+            if self.verbose and (not self._printed_active):
+                print("[ADAPTATION] active (injecting joint_range + mass_desc + mass_gps)")
+                self._printed_active = True
+
+        # 3) Compute action
+        with torch.no_grad():
+            action = self.policy(
+                desc_used.unsqueeze(0),
+                state.unsqueeze(0),
+                gps_used.unsqueeze(0),
+            ).squeeze(0)
+
+        # 4) Add history (state, action, cmd_vel) for NEXT step prediction
+        if self.enable_adaptation and (self.adaptation is not None):
+            cmd_vel = gps[3:6]  # goal velocities
+            self.adaptation.add_history(
+                state=state.unsqueeze(0),
+                action=action.unsqueeze(0),
+                cmd_vel=cmd_vel.unsqueeze(0),
+            )
+
+            if self.verbose and (not self.adaptation.has_prediction):
+                print(f"[ADAPTATION] warming up: hist={self.adaptation.hist_idx}/{self.adaptation.W}")
+
+        debug = {
+            "step": self.global_step,
+            "command_velocity": cmd_vel.cpu().numpy().tolist(),
+            "has_prediction": has_pred,
+            "hist_idx": (self.adaptation.hist_idx if self.adaptation else None),
+        }
+        self.global_step += 1
+        return action, debug
+
+
+# -------------------------
+# RobotHandler (deployment)
+# -------------------------
 class RobotHandler(Node):
     def __init__(self):
         super().__init__("robot_handler")
 
+        # --- Unitree channel & state client ---
         ChannelFactoryInitialize(0, "eno1")
         rsc = RobotStateClient()
         rsc.Init()
         rsc.ServiceSwitch("sport_mode", False)
 
+        # --- ROS QoS ---
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             depth=10
@@ -79,7 +363,7 @@ class RobotHandler(Node):
             self.low_state_callback,
             qos_profile=qos_profile
         )
-        
+
         self.joystick_subscription = self.create_subscription(
             WirelessController,
             "/wirelesscontroller",
@@ -93,18 +377,20 @@ class RobotHandler(Node):
             qos_profile=qos_profile
         )
 
+        # --- Default LowCmd (UNCHANGED) ---
         self.default_low_cmd = LowCmd()
         self.default_low_cmd.head[0] = 0xFE
         self.default_low_cmd.head[1] = 0xEF
         self.default_low_cmd.level_flag = 0xFF
         for i in range(20):
             self.default_low_cmd.motor_cmd[i].mode = 0x01  # (PMSM) mode
-            self.default_low_cmd.motor_cmd[i].q = 0.0 # 2.146e9
-            self.default_low_cmd.motor_cmd[i].dq = 0.0 # 16000.0
+            self.default_low_cmd.motor_cmd[i].q = 0.0
+            self.default_low_cmd.motor_cmd[i].dq = 0.0
             self.default_low_cmd.motor_cmd[i].kp = 0.0
             self.default_low_cmd.motor_cmd[i].kd = 0.0
             self.default_low_cmd.motor_cmd[i].tau = 0.0
 
+        # --- Robot state (UNCHANGED) ---
         self.joint_positions = np.zeros(12)
         self.joint_velocities = np.zeros(12)
         self.orientation = np.array([0.0, 0.0, 0.0, 1.0])
@@ -130,8 +416,8 @@ class RobotHandler(Node):
         self.stand_and_lie_p_gain = 70.0
         self.stand_and_lie_d_gain = 3.0
 
-        self.velocity_safety_threshold = 10.0
-        self.goal_clip = 0.5
+        self.velocity_safety_threshold = 15.0
+        self.goal_clip = 1.0
 
         self.nn_p_gain = 20.0
         self.nn_d_gain = 0.5
@@ -149,10 +435,11 @@ class RobotHandler(Node):
         self.last_seen_control_mode = None
         self.control_mode = None
 
-        self.joint_ids_to_lock = [] # Put the joint ids that you want to lock here
+        # --- Hard locking config (KEEP ORIGINAL) ---
+        self.joint_ids_to_lock = []  # Put the joint ids that you want to lock here
         self.hard_locked_factor = 0.0
         # self.joint_ids_to_lock = [3, 4, 5] # Put the joint ids that you want to lock here
-        # self.hard_locked_factor = 0.1
+        # self.hard_locked_factor = 0.2
         self.joint_limits = np.array([
             [-1.0472,   1.0472 ],
             [-1.5708,   3.4907 ],
@@ -167,41 +454,65 @@ class RobotHandler(Node):
             [-0.5236,   4.5379 ],
             [-2.7227,  -0.83776],
         ])
+
         self.hard_joint_lower_limits = self.joint_limits[:, 0]
-        self.hard_joint_lower_limits[self.joint_ids_to_lock] = self.hard_locked_factor * self.hard_joint_lower_limits[self.joint_ids_to_lock] + (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        self.hard_joint_lower_limits[self.joint_ids_to_lock] = \
+            self.hard_locked_factor * self.hard_joint_lower_limits[self.joint_ids_to_lock] + \
+            (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+
         self.hard_joint_upper_limits = self.joint_limits[:, 1]
-        self.hard_joint_upper_limits[self.joint_ids_to_lock] = self.hard_locked_factor * self.hard_joint_upper_limits[self.joint_ids_to_lock] + (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        self.hard_joint_upper_limits[self.joint_ids_to_lock] = \
+            self.hard_locked_factor * self.hard_joint_upper_limits[self.joint_ids_to_lock] + \
+            (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+
         self.high_p_gain = np.ones(12) * 60.0
         self.high_d_gain = np.ones(12) * 1.0
 
+        # --- Policy load (UNCHANGED) ---
         self.load_policy("2025-11-21_01-36-14_model_5999.pt")
 
-        print(f"Robot ready. Model running on {jax.default_backend()}.")
+        # --- Online adaptation runner (CPU, freq=1). Model placeholders inside. ---
+        self.urma_runner = DeploymentUrmaAdaptationRunner(
+            policy=self.policy,
+            metadata=self.metadata,
+            window_length=20,
+            adaptation_freq=1,
+            enable_adaptation=True,
+            verbose=True,
+            device="cpu",
+        )
+        # OPTIONAL: you will implement and enable this:
+        self.urma_runner.load_adaptation_checkpoint("adaptation_module/2026-01-22_16-56-48_online_urma_offline_adaptation_GenBot1K-adp-v2_training/adaptive_configure_model_epoch100.pth")
+
+        print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
 
         self.timer = self.create_timer(1 / self.control_frequency, self.timer_callback)
 
-
+    # ----------------
+    # ROS callbacks
+    # ----------------
     def switch_control_mode(self, control_mode):
         self.previous_control_mode = self.control_mode if self.control_mode != control_mode else self.previous_control_mode
         self.control_mode = control_mode
         print(f"Switched to control mode: {self.control_mode}")
-    
 
     def low_state_callback(self, msg):
         motor_states = msg.motor_state
         self.joint_positions = np.array([motor_states[i].q for i in range(12)])
-
         self.joint_velocities = np.array([motor_states[i].dq for i in range(12)])
-
-        self.orientation = np.array([msg.imu_state.quaternion[1], msg.imu_state.quaternion[2], msg.imu_state.quaternion[3], msg.imu_state.quaternion[0]])
+        self.orientation = np.array([
+            msg.imu_state.quaternion[1],
+            msg.imu_state.quaternion[2],
+            msg.imu_state.quaternion[3],
+            msg.imu_state.quaternion[0],
+        ])
         self.angular_velocity = msg.imu_state.gyroscope
 
-    
     def joystick_callback(self, msg):
         self.x_goal_velocity = np.clip(msg.ly, -self.goal_clip, self.goal_clip)
         self.y_goal_velocity = np.clip(-msg.lx, -self.goal_clip, self.goal_clip)
         self.yaw_goal_velocity = np.clip(-msg.rx, -self.goal_clip, self.goal_clip)
-        
+
         if msg.keys == 2048:
             self.switch_control_mode("stand_up")
         elif msg.keys == 1024:
@@ -210,9 +521,12 @@ class RobotHandler(Node):
             self.switch_control_mode("nn")
         elif msg.keys == 256:
             self.switch_control_mode("stop")
-    
 
+    # ----------------
+    # Main loop
+    # ----------------
     def timer_callback(self):
+        # KEEP ORIGINAL safety logic (no abs)
         if np.max(self.joint_velocities) > self.velocity_safety_threshold:
             print("Velocity safety threshold exceeded.")
             self.switch_control_mode("stand_up")
@@ -225,16 +539,18 @@ class RobotHandler(Node):
             self.nn()
         elif self.control_mode == "stop":
             ...
-        
+
         self.last_seen_control_mode = self.control_mode
 
-    
+    # ----------------
+    # Stand/Lie (UNCHANGED)
+    # ----------------
     def stand_up(self):
         if self.last_seen_control_mode != "stand_up":
             self.standing_delta = self.nominal_joint_positions - self.joint_positions
             self.standing_intermediate_position = deepcopy(self.joint_positions)
             self.standing_counter = 0
-        
+
         if self.standing_counter < self.stand_and_lie_seconds * self.control_frequency:
             self.standing_counter += 1
             self.standing_intermediate_position += self.standing_delta / (self.stand_and_lie_seconds * self.control_frequency)
@@ -247,18 +563,16 @@ class RobotHandler(Node):
             low_cmd.motor_cmd[i].q = target_positions[i]
             low_cmd.motor_cmd[i].kp = self.stand_and_lie_p_gain
             low_cmd.motor_cmd[i].kd = self.stand_and_lie_d_gain
-        
+
         low_cmd.crc = get_crc(low_cmd)
-        
         self.publisher.publish(low_cmd)
 
-    
     def lie_down(self):
         if self.last_seen_control_mode != "lie_down":
             self.lying_delta = self.lying_joint_positions - self.joint_positions
             self.lying_intermediate_position = deepcopy(self.joint_positions)
             self.lying_counter = 0
-        
+
         if self.lying_counter < self.stand_and_lie_seconds * self.control_frequency:
             self.lying_counter += 1
             self.lying_intermediate_position += self.lying_delta / (self.stand_and_lie_seconds * self.control_frequency)
@@ -271,77 +585,85 @@ class RobotHandler(Node):
             low_cmd.motor_cmd[i].q = target_positions[i]
             low_cmd.motor_cmd[i].kp = self.stand_and_lie_p_gain
             low_cmd.motor_cmd[i].kd = self.stand_and_lie_d_gain
-        
+
         low_cmd.crc = get_crc(low_cmd)
-        
         self.publisher.publish(low_cmd)
 
+    # ----------------
+    # Observation construction (UNCHANGED)
+    # ----------------
     def construct_go2_observation(self, qpos, qvel, previous_action, trunk_angular_velocity, goal_velocities, projected_gravity_vector):
         """
-        Construct the one policy observation for Go2 robot from both onboard observation and static embodiment parameters.
-        The joint order is in policy side order.
+        EXACTLY your original deployment observation builder.
+        (Keeps all fields + normalization + ordering you already validated.)
         """
-        
-        # dynamic joint description invariant elements
         self.relative_joint_position_normalized = np.array([
-                                                    [0.9258, 0.6198, 0.8478],
-                                                    [0.9258, 0.3802, 0.8478],
-                                                    [0.3186, 0.6198, 0.8478],
-                                                    [0.3186, 0.3802, 0.8478],
-                                                    [0.9258, 0.8634, 0.8726],
-                                                    [0.9258, 0.1366, 0.8726],
-                                                    [0.3186, 0.8634, 0.8726],
-                                                    [0.3186, 0.1366, 0.8726],
-                                                    [0.6792, 0.9014, 0.4876],
-                                                    [0.6792, 0.0986, 0.4876],
-                                                    [0.0294, 0.8928, 0.5740],
-                                                    [0.0294, 0.1072, 0.5740]])
+            [0.9258, 0.6198, 0.8478],
+            [0.9258, 0.3802, 0.8478],
+            [0.3186, 0.6198, 0.8478],
+            [0.3186, 0.3802, 0.8478],
+            [0.9258, 0.8634, 0.8726],
+            [0.9258, 0.1366, 0.8726],
+            [0.3186, 0.8634, 0.8726],
+            [0.3186, 0.1366, 0.8726],
+            [0.6792, 0.9014, 0.4876],
+            [0.6792, 0.0986, 0.4876],
+            [0.0294, 0.8928, 0.5740],
+            [0.0294, 0.1072, 0.5740]
+        ])
         self.relative_joint_axis_local = np.array([
-                                                    [ 1.0000e+00,  2.1027e-09,  1.0610e-09],
-                                                    [ 1.0000e+00, -1.8324e-09,  6.3952e-10],
-                                                    [ 1.0000e+00,  4.6547e-11, -9.3016e-10],
-                                                    [ 1.0000e+00, -1.0698e-09, -2.7439e-09],
-                                                    [-2.3842e-07,  9.9500e-01,  9.9833e-02],
-                                                    [ 0.0000e+00,  9.9500e-01, -9.9833e-02],
-                                                    [-2.3842e-07,  9.9500e-01,  9.9833e-02],
-                                                    [ 1.7881e-07,  9.9500e-01, -9.9833e-02],
-                                                    [-1.1921e-07,  9.9500e-01,  9.9833e-02],
-                                                    [ 0.0000e+00,  9.9500e-01, -9.9833e-02],
-                                                    [-1.1921e-07,  9.9500e-01,  9.9834e-02],
-                                                    [ 0.0000e+00,  9.9500e-01, -9.9833e-02]])
-        self.joint_nominal_positions = np.array([ 0.1000, -0.1000,  0.1000, -0.1000,  0.8000,  0.8000,  1.0000,  1.0000, -1.5000, -1.5000, -1.5000, -1.5000])
-        self.desc_joint_max_torque = np.array([23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000])
+            [ 1.0000e+00,  2.1027e-09,  1.0610e-09],
+            [ 1.0000e+00, -1.8324e-09,  6.3952e-10],
+            [ 1.0000e+00,  4.6547e-11, -9.3016e-10],
+            [ 1.0000e+00, -1.0698e-09, -2.7439e-09],
+            [-2.3842e-07,  9.9500e-01,  9.9833e-02],
+            [ 0.0000e+00,  9.9500e-01, -9.9833e-02],
+            [-2.3842e-07,  9.9500e-01,  9.9833e-02],
+            [ 1.7881e-07,  9.9500e-01, -9.9833e-02],
+            [-1.1921e-07,  9.9500e-01,  9.9833e-02],
+            [ 0.0000e+00,  9.9500e-01, -9.9833e-02],
+            [-1.1921e-07,  9.9500e-01,  9.9834e-02],
+            [ 0.0000e+00,  9.9500e-01, -9.9833e-02]
+        ])
+        self.joint_nominal_positions = np.array([ 0.1000, -0.1000,  0.1000, -0.1000,  0.8000,  0.8000,
+                                                 1.0000,  1.0000, -1.5000, -1.5000, -1.5000, -1.5000])
+        self.desc_joint_max_torque = np.array([23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000,
+                                               23.5000, 23.5000, 23.5000, 23.5000, 23.5000, 23.5000])
         self.joint_max_velocity = np.array([30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30.])
-        self.desc_joint_lower_limits = np.array([-1.0500, -1.0500, -1.0500, -1.0500, -1.5700, -1.5700, -0.5200, -0.5200, -2.7200, -2.7200, -2.7200, -2.7200])
-        self.desc_joint_upper_limits = np.array([ 1.0500,  1.0500,  1.0500,  1.0500,  3.4900,  3.4900,  4.5300,  4.5300, -0.8400, -0.8400, -0.8400, -0.8400])
-        # self.desc_joint_lower_limits = np.array([-0.0150, -1.0500, -1.0500, -1.0500,  0.5630, -1.5700, -0.5200, -0.5200, -1.6220, -2.7200, -2.7200, -2.7200]) # lock fl to 0.1
-        # self.desc_joint_upper_limits = np.array([ 0.1950,  1.0500,  1.0500,  1.0500,  1.0690,  3.4900,  4.5300,  4.5300, -1.4340, -0.8400, -0.8400, -0.8400]) # lock fl to 0.1
+        self.desc_joint_lower_limits = np.array([-1.0500, -1.0500, -1.0500, -1.0500, -1.5700, -1.5700,
+                                                 -0.5200, -0.5200, -2.7200, -2.7200, -2.7200, -2.7200])
+        self.desc_joint_upper_limits = np.array([ 1.0500,  1.0500,  1.0500,  1.0500,  3.4900,  3.4900,
+                                                  4.5300,  4.5300, -0.8400, -0.8400, -0.8400, -0.8400])
 
-        # general policy state invariant 11 elements
         self.gains_and_action_scaling_factor = np.array([20.0000,  0.5000,  0.3000])
         self.desc_mass = np.array([15.017])
         self.robot_dimensions = np.array([0.6196, 0.3902, 0.3835])
         self.nr_joints = np.array([12])
         self.scaled_foot_size = np.array([-0.8240, -0.8240, -0.8240])
-        
+
         dynamic_joint_observations = np.empty(0)
         for i in range(12):
             desc_vector = np.concatenate([
-            (self.relative_joint_position_normalized[i, :] / 0.5) - 1.0,
-            self.relative_joint_axis_local[i, :],
-            np.array([self.joint_nominal_positions[i]]) / 4.6,
-            (np.array([self.desc_joint_max_torque[i]]) / 500.0) - 1.0,
-            (np.array([self.joint_max_velocity[i]]) / 17.5) - 1.0,
-            np.array([self.desc_joint_lower_limits[i]]),
-            np.array([self.desc_joint_upper_limits[i]]),
-            ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
-            (self.desc_mass / 85.0) - 1.0,
-            (self.robot_dimensions / 1.0) - 1.0,
+                (self.relative_joint_position_normalized[i, :] / 0.5) - 1.0,
+                self.relative_joint_axis_local[i, :],
+                np.array([self.joint_nominal_positions[i]]) / 4.6,
+                (np.array([self.desc_joint_max_torque[i]]) / 500.0) - 1.0,
+                (np.array([self.joint_max_velocity[i]]) / 17.5) - 1.0,
+                np.array([self.desc_joint_lower_limits[i]]),
+                np.array([self.desc_joint_upper_limits[i]]),
+                ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
+                (self.desc_mass / 85.0) - 1.0,
+                (self.robot_dimensions / 1.0) - 1.0,
             ])
-            
-            current_observation = np.concatenate((desc_vector, np.array([qpos[i]]), np.array([qvel[i]]), np.array([previous_action[i]])))
+
+            current_observation = np.concatenate((
+                desc_vector,
+                np.array([qpos[i]]),
+                np.array([qvel[i]]),
+                np.array([previous_action[i]])
+            ))
             dynamic_joint_observations = np.concatenate((dynamic_joint_observations, current_observation))
-        
+
         observation = np.concatenate([
             dynamic_joint_observations,
             np.clip(trunk_angular_velocity / 50.0, -10.0, 10.0),
@@ -353,18 +675,21 @@ class RobotHandler(Node):
             (self.nr_joints / 15.0 - 1.0),
             self.scaled_foot_size
         ])
-        
+
         return observation
-        
+
+    # ----------------
+    # NN control (hardware logic kept; only swapped policy call path)
+    # ----------------
     def nn(self):
-        # Only run neural network if it's already running or if the robot is standing up
+        # KEEP ORIGINAL gating
         if self.last_seen_control_mode != "nn" and self.last_seen_control_mode != "stand_up":
             return
-        
+
         if self.last_seen_control_mode != "nn":
             self.previous_action = np.zeros(12)
 
-        # dynamic joint state
+        # dynamic joint state (policy order) - KEEP ORIGINAL
         qpos = (self.joint_positions - self.nominal_joint_positions) / 4.6
         qpos = qpos[self.obs_reorder_mask]
 
@@ -373,23 +698,30 @@ class RobotHandler(Node):
 
         previous_action = self.previous_action / 10.0
         previous_action = previous_action[self.obs_reorder_mask]
-        
-        # general policy state variant 9 elements
+
+        # general policy state variant - KEEP ORIGINAL
         trunk_angular_velocity = self.angular_velocity
         goal_velocities = np.array([self.x_goal_velocity, self.y_goal_velocity, self.yaw_goal_velocity])
         orientation_quat_inv = R.from_quat(self.orientation).inv()
         projected_gravity_vector = orientation_quat_inv.apply(np.array([0.0, 0.0, -1.0]))
-        
-        observation = self.construct_go2_observation(qpos, qvel, previous_action, trunk_angular_velocity, goal_velocities, projected_gravity_vector)
-        observation = torch.from_numpy(observation).float()
-        dynamic_joint_description, dynamic_joint_state, general_state = one_policy_observation_to_inputs(observation, self.metadata)
-        action = self.policy(dynamic_joint_description.unsqueeze(0), dynamic_joint_state.unsqueeze(0), general_state.unsqueeze(0)).squeeze(0)
 
+        # Build observation (KEEP ORIGINAL)
+        observation = self.construct_go2_observation(
+            qpos, qvel, previous_action,
+            trunk_angular_velocity, goal_velocities, projected_gravity_vector
+        )
+        observation = torch.from_numpy(observation).float()
+
+        # NEW: runner handles (prediction->inject->action->history)
+        action_t, debug = self.urma_runner.step(observation)
+
+        # KEEP ORIGINAL downstream logic: reorder + convert to numpy
+        action = action_t.detach().cpu().numpy()
         action = action[self.action_reorder_mask]
-        action = action.detach().numpy()
 
         target_joint_positions = self.nominal_joint_positions + self.scaling_factor * action
 
+        # KEEP ORIGINAL hard-locking / gain logic (even if p_gains/d_gains not used later)
         hard_lower_diff = -(self.joint_positions[self.joint_ids_to_lock] - self.hard_joint_lower_limits[self.joint_ids_to_lock])
         hard_upper_diff = self.joint_positions[self.joint_ids_to_lock] - self.hard_joint_upper_limits[self.joint_ids_to_lock]
 
@@ -400,36 +732,53 @@ class RobotHandler(Node):
         p_gains = np.ones(12) * self.nn_p_gain
         d_gains = np.ones(12) * self.nn_d_gain
 
-        p_gains[self.joint_ids_to_lock] = np.where(hard_out_of_limits, self.high_p_gain[self.joint_ids_to_lock], p_gains[self.joint_ids_to_lock])
-        d_gains[self.joint_ids_to_lock] = np.where(hard_out_of_limits, self.high_d_gain[self.joint_ids_to_lock], d_gains[self.joint_ids_to_lock])
+        p_gains[self.joint_ids_to_lock] = np.where(
+            hard_out_of_limits, self.high_p_gain[self.joint_ids_to_lock], p_gains[self.joint_ids_to_lock]
+        )
+        d_gains[self.joint_ids_to_lock] = np.where(
+            hard_out_of_limits, self.high_d_gain[self.joint_ids_to_lock], d_gains[self.joint_ids_to_lock]
+        )
 
-        target_joint_positions[self.joint_ids_to_lock] = np.clip(target_joint_positions[self.joint_ids_to_lock], self.hard_joint_lower_limits[self.joint_ids_to_lock], self.hard_joint_upper_limits[self.joint_ids_to_lock])
+        target_joint_positions[self.joint_ids_to_lock] = np.clip(
+            target_joint_positions[self.joint_ids_to_lock],
+            self.hard_joint_lower_limits[self.joint_ids_to_lock],
+            self.hard_joint_upper_limits[self.joint_ids_to_lock]
+        )
 
+        # KEEP ORIGINAL command sending (kp/kd set to nn gains globally)
         low_cmd = deepcopy(self.default_low_cmd)
         for i in range(12):
             low_cmd.motor_cmd[i].q = target_joint_positions[i]
             low_cmd.motor_cmd[i].kp = self.nn_p_gain
             low_cmd.motor_cmd[i].kd = self.nn_d_gain
-        
+
         low_cmd.crc = get_crc(low_cmd)
 
-        import time
+        # KEEP ORIGINAL dt debug + add adaptation flags
         now = time.time()
         if hasattr(self, "last_publish_time_wall"):
-            print("dt:", now - self.last_publish_time_wall)
+            print("dt:", now - self.last_publish_time_wall, "command velocity", debug.get("command_velocity"), "| adp:", debug.get("has_prediction"), "| hist:", debug.get("hist_idx"))
         self.last_publish_time_wall = now
 
         self.publisher.publish(low_cmd)
-        
-        self.previous_action = action
-    
 
+        # KEEP ORIGINAL
+        self.previous_action = action
+
+    # ----------------
+    # Policy loading (UNCHANGED)
+    # ----------------
     def load_policy(self, model_file_name):
         current_path = os.path.dirname(__file__)
         checkpoint_dir = os.path.join(current_path, "policies")
         model_path = os.path.join(checkpoint_dir, model_file_name)
+
         state_dict = torch.load(model_path, map_location=torch.device("cpu"))
-        actor_state_dict = {k.replace("actor.", "", 1): v for k, v in state_dict["model_state_dict"].items() if k.startswith("actor.")}
+        actor_state_dict = {
+            k.replace("actor.", "", 1): v
+            for k, v in state_dict["model_state_dict"].items()
+            if k.startswith("actor.")
+        }
 
         self.policy = get_policy(torch.device("cpu"))
         self.policy.load_state_dict(actor_state_dict)
