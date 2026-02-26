@@ -281,34 +281,40 @@ class DeploymentUrmaAdaptationRunner:
         """
         one_policy_observation = one_policy_observation.to(self.device)
 
-        # Parse
+        # Parse observation
         desc_gt, state, gps = one_policy_observation_to_inputs(one_policy_observation, self.metadata)
 
-        # 1) Update predictions FIRST (based on previous history)
+        # Get adaptation predictions (if enabled) - use existing predictions from previous step
         if self.enable_adaptation and (self.adaptation is not None):
-            self.adaptation.update_predictions()
+            has_pred = self.adaptation.has_prediction
+            joint_range_adapted = self.adaptation.joint_range_pred
+            mass_desc_adapted = self.adaptation.mass_desc_pred
+            mass_gps_adapted = self.adaptation.mass_gps_pred
+        else:
+            has_pred = False
+            joint_range_adapted = torch.zeros((1, self.metadata.nr_dynamic_joint_observations, 2), device=self.device)
+            mass_desc_adapted = torch.zeros((1, self.metadata.nr_dynamic_joint_observations, 1), device=self.device)
+            mass_gps_adapted = torch.zeros((1, 1), device=self.device)
 
-        # 2) Inject (if has prediction)
+        # Decide what to feed policy
         desc_used = desc_gt.clone()
         gps_used = gps.clone()
 
-        has_pred = False
+        # Inject predictions if available and conditions met
         cmd_vel = gps[3:6]  # goal velocities
-        if self.enable_adaptation and (self.adaptation is not None) and self.adaptation.has_prediction and cmd_vel.norm() > 0.1:
-            has_pred = True
-
+        if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > 0.1:
             # joint_range1=lower, joint_range2=upper  -> desc[:,9:11]
-            # desc_used[:, 9:11] = self.adaptation.joint_range_pred[0]
+            desc_used[:, 9:11] = joint_range_adapted[0]
             # mass in desc -> desc[:,14:15]
-            desc_used[:, 14:15] = self.adaptation.mass_desc_pred[0]
+            desc_used[:, 14:15] = mass_desc_adapted[0]
             # mass in gps -> gps[12] (since gps = [9] + [last11], mass sits at index 12)
-            gps_used[12:13] = self.adaptation.mass_gps_pred[0]
+            gps_used[12:13] = mass_gps_adapted[0]
 
             if self.verbose and (not self._printed_active):
                 print("[ADAPTATION] active (injecting joint_range + mass_desc + mass_gps)")
                 self._printed_active = True
 
-        # 3) Compute action
+        # Run policy
         with torch.no_grad():
             action = self.policy(
                 desc_used.unsqueeze(0),
@@ -316,7 +322,7 @@ class DeploymentUrmaAdaptationRunner:
                 gps_used.unsqueeze(0),
             ).squeeze(0)
 
-        # 4) Add history (state, action, cmd_vel) for NEXT step prediction
+        # Update adaptation with new action (matches simulation order)
         if self.enable_adaptation and (self.adaptation is not None):
             cmd_vel = gps[3:6]  # goal velocities
             self.adaptation.add_history(
@@ -324,6 +330,8 @@ class DeploymentUrmaAdaptationRunner:
                 action=action.unsqueeze(0),
                 cmd_vel=cmd_vel.unsqueeze(0),
             )
+            # Update predictions AFTER adding history (matches simulation)
+            self.adaptation.update_predictions()
 
             if self.verbose and (not self.adaptation.has_prediction):
                 print(f"[ADAPTATION] warming up: hist={self.adaptation.hist_idx}/{self.adaptation.W}")
@@ -436,10 +444,10 @@ class RobotHandler(Node):
         self.control_mode = None
 
         # --- Hard locking config (KEEP ORIGINAL) ---
-        self.joint_ids_to_lock = []  # Put the joint ids that you want to lock here
-        self.hard_locked_factor = 0.0
-        # self.joint_ids_to_lock = [3, 4, 5] # Put the joint ids that you want to lock here
-        # self.hard_locked_factor = 0.2
+        # self.joint_ids_to_lock = []  # Put the joint ids that you want to lock here
+        # self.hard_locked_factor = 0.0
+        self.joint_ids_to_lock = [3, 4, 5] # Put the joint ids that you want to lock here
+        self.hard_locked_factor = 0.2
         self.joint_limits = np.array([
             [-1.0472,   1.0472 ],
             [-1.5708,   3.4907 ],
