@@ -46,16 +46,14 @@ from policy import get_policy
 
 
 # -------------------------
-# Shared parsing function
+# Deployment observation parser (standalone, matches simulation output format)
+# Deployment obs: 272 elements. general_policy_state = trunk(3)+goal(3)+gravity(3)+mass(1) = 10 elements.
+# Mass is at index 264 (gains 261-263 sit between gravity and mass).
 # -------------------------
 def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metadata: SimpleNamespace):
     """
-    EXACTLY matches your original parsing logic.
-
-    Returns:
-      dynamic_joint_description: (J, 18)
-      dynamic_joint_state      : (J,  3)  [qpos, qvel, prev_action]
-      general_policy_state     : (20,)    [9 + last11]
+    Parse deployment observation into policy inputs.
+    Returns general_policy_state (10 elements) matching simulation format.
     """
     nr_dynamic_joint_observations = metadata.nr_dynamic_joint_observations
     single_dynamic_joint_observation_length = metadata.single_dynamic_joint_observation_length
@@ -71,13 +69,15 @@ def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metad
     trunk_angular_vel_update_obs_idx = metadata.trunk_angular_vel_update_obs_idx
     goal_velocity_update_obs_idx = metadata.goal_velocity_update_obs_idx
     projected_gravity_update_obs_idx = metadata.projected_gravity_update_obs_idx
-
-    general_policy_state = one_policy_observation[
-        ..., trunk_angular_vel_update_obs_idx + goal_velocity_update_obs_idx + projected_gravity_update_obs_idx
-    ]
-    GENERAL_POLICY_STATE_LEN = 11
+    # Deployment: trunk(252-254)+goal(255-257)+gravity(258-260), then gains(261-263), then mass(264)
+    variant_indices = trunk_angular_vel_update_obs_idx + goal_velocity_update_obs_idx + projected_gravity_update_obs_idx
+    mass_obs_idx = 264
     general_policy_state = torch.cat(
-        (general_policy_state, one_policy_observation[..., -GENERAL_POLICY_STATE_LEN:]), dim=-1
+        [
+            one_policy_observation[..., variant_indices],
+            one_policy_observation[..., mass_obs_idx : mass_obs_idx + 1],
+        ],
+        dim=-1,
     )
 
     return dynamic_joint_description, dynamic_joint_state, general_policy_state
@@ -85,73 +85,50 @@ def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metad
 
 # ----------------------------------------
 # Deployment Adaptation Module (single env)
+# Uses model_explicit: desc_pred (B,J,4) for indices [6,7,9,10], pol_pred (B,1) for mass.
 # ----------------------------------------
 class DeploymentAdaptationModule:
     """
-    Single-robot adaptation module:
-    - maintains history (state, action, cmd_vel) of length W
-    - periodically predicts normalized description entries
-    - stores predictions + has_prediction flag
-
-    Placeholder model parts are left for you.
+    Single-robot adaptation module matching eval_actor_urma_adaptive.py.
     """
 
-    def __init__(self, window_length: int = 20, adaptation_freq: int = 1, num_joints: int = 12, device="cpu"):
+    def __init__(self, window_length: int = 10, adaptation_freq: int = 1, num_joints: int = 12, device="cpu"):
         self.W = int(window_length)
         self.adaptation_freq = int(adaptation_freq)
         self.J = int(num_joints)
         self.device = torch.device(device)
 
         # History on CPU (stable)
-        self.state_hist = torch.zeros((1, self.W, self.J, 3), device="cpu")   # (1,W,J,3)
-        self.target_hist = torch.zeros((1, self.W, self.J, 1), device="cpu")  # (1,W,J,1)
-        self.cmdvel_hist = torch.zeros((1, self.W, 3), device="cpu")          # (1,W,3)
+        self.state_hist = torch.zeros((1, self.W, self.J, 3), device="cpu")
+        self.target_hist = torch.zeros((1, self.W, self.J, 1), device="cpu")
+        self.cmdvel_hist = torch.zeros((1, self.W, 3), device="cpu")
         self.hist_idx = 0
 
-        # Predictions in normalized space (on self.device)
+        # Predictions: desc_pred (1,J,4) for indices [6,7,9,10], pol_pred (1,1) for mass
         self.has_prediction = False
-        self.joint_range_pred = torch.zeros((1, self.J, 2), device=self.device)  # desc[:, 9:11]
-        self.mass_desc_pred = torch.zeros((1, self.J, 1), device=self.device)    # desc[:, 14:15]
-        self.mass_gps_pred = torch.zeros((1, 1), device=self.device)             # gps mass (index 12)
+        self.desc_pred = torch.zeros((1, self.J, 4), device=self.device)
+        self.pol_pred = torch.zeros((1, 1), device=self.device)
 
         self._step = 0
         self.model = self._build_model()
 
-    # -------- YOU implement these 3 ----------
     def _build_model(self):
-        """
-        Return a torch.nn.Module that matches your sim adaptation model:
-          model(state_seq, target_seq, cmdvel_seq) ->
-              dynamic_joint_description_pred: (B,J,>=15)
-              invariant_general_policy_state_pred: (B, >=4)
-        """
-        import model2
-        model = model2.get_policy(self.W, self.device)
-        return model
+        import model_explicit
+        return model_explicit.get_policy(self.W, self.device)
 
     def load_checkpoint(self, ckpt_path: str):
-        """
-        Load adaptation checkpoint into self.model.
-        """
         adaptation_state = torch.load(ckpt_path, map_location=self.device)
-        # Try loading directly first, then try with "model_state_dict" key if that fails
         try:
             self.model.load_state_dict(adaptation_state)
-        except:
+        except Exception:
             self.model.load_state_dict(adaptation_state["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()
         print(f"[INFO] Adaptation checkpoint loaded from {ckpt_path}")
-        return
 
     def _forward_model(self, state_seq: torch.Tensor, target_seq: torch.Tensor, cmdvel_seq: torch.Tensor):
-        """
-        Run the adaptation model forward and return:
-          dynamic_joint_description_pred, invariant_general_policy_state_pred
-        """
         with torch.no_grad():
             return self.model(state_seq, target_seq, cmdvel_seq)
-    # -----------------------------------------
 
     def reset(self):
         self.state_hist.zero_()
@@ -192,12 +169,9 @@ class DeploymentAdaptationModule:
 
     def update_predictions(self):
         """
-        Step order requirement: call this at the START of each control tick.
-
-        If history full and due, run model and update:
-          - joint_range_pred (desc[:,9:11])  lower/upper
-          - mass_desc_pred   (desc[:,14:15])
-          - mass_gps_pred    (gps mass from invariant head index 3:4 -> mapped to gps[12])
+        If history full and due, run model_explicit and update:
+          desc_pred (1,J,4): [0]=joint_nominal, [1]=torque_limit, [2]=joint_range1, [3]=joint_range2
+          pol_pred (1,1): mass
         """
         self._step += 1
         due = (self._step % self.adaptation_freq == 0)
@@ -209,18 +183,14 @@ class DeploymentAdaptationModule:
         if self.model is None:
             return
 
-        state_seq = self.state_hist.to(self.device)   # (1,W,J,3)
-        target_seq = self.target_hist.to(self.device) # (1,W,J,1)
-        cmdvel_seq = self.cmdvel_hist.to(self.device) # (1,W,3)
+        state_seq = self.state_hist.to(self.device)
+        target_seq = self.target_hist.to(self.device)
+        cmdvel_seq = self.cmdvel_hist.to(self.device)
 
-        dynamic_joint_description_pred, invariant_general_policy_state_pred = \
-            self._forward_model(state_seq, target_seq, cmdvel_seq)
+        desc_pred, pol_pred = self._forward_model(state_seq, target_seq, cmdvel_seq)
 
-        # Same indexing contract as sim:
-        self.joint_range_pred[...] = dynamic_joint_description_pred[:, :, 9:11]
-        self.mass_desc_pred[...] = dynamic_joint_description_pred[:, :, 14:15]
-        self.mass_gps_pred[...] = invariant_general_policy_state_pred[:, 3:4]
-
+        self.desc_pred[...] = desc_pred
+        self.pol_pred[...] = pol_pred
         self.has_prediction = True
 
 
@@ -281,37 +251,35 @@ class DeploymentUrmaAdaptationRunner:
         """
         one_policy_observation = one_policy_observation.to(self.device)
 
-        # Parse observation
+        # Parse observation (10-element general_policy_state: trunk+goal+gravity+mass)
         desc_gt, state, gps = one_policy_observation_to_inputs(one_policy_observation, self.metadata)
 
         # Get adaptation predictions (if enabled) - use existing predictions from previous step
         if self.enable_adaptation and (self.adaptation is not None):
             has_pred = self.adaptation.has_prediction
-            joint_range_adapted = self.adaptation.joint_range_pred
-            mass_desc_adapted = self.adaptation.mass_desc_pred
-            mass_gps_adapted = self.adaptation.mass_gps_pred
+            desc_adapted = self.adaptation.desc_pred   # (1, J, 4) for indices [6, 7, 9, 10]
+            pol_adapted = self.adaptation.pol_pred    # (1, 1) for mass
         else:
             has_pred = False
-            joint_range_adapted = torch.zeros((1, self.metadata.nr_dynamic_joint_observations, 2), device=self.device)
-            mass_desc_adapted = torch.zeros((1, self.metadata.nr_dynamic_joint_observations, 1), device=self.device)
-            mass_gps_adapted = torch.zeros((1, 1), device=self.device)
+            desc_adapted = torch.zeros((1, self.metadata.nr_dynamic_joint_observations, 4), device=self.device)
+            pol_adapted = torch.zeros((1, 1), device=self.device)
 
         # Decide what to feed policy
         desc_used = desc_gt.clone()
         gps_used = gps.clone()
 
-        # Inject predictions if available and conditions met
+        # Inject predictions if available and conditions met (matches eval_actor_urma_adaptive)
         cmd_vel = gps[3:6]  # goal velocities
         if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > 0.1:
-            # joint_range1=lower, joint_range2=upper  -> desc[:,9:11]
-            desc_used[:, 9:11] = joint_range_adapted[0]
-            # mass in desc -> desc[:,14:15]
-            desc_used[:, 14:15] = mass_desc_adapted[0]
-            # mass in gps -> gps[12] (since gps = [9] + [last11], mass sits at index 12)
-            gps_used[12:13] = mass_gps_adapted[0]
+            # desc_pred[:,:,0]->index 6, [1]->7, [2]->9, [3]->10; pol_pred->gps[-1]
+            desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
+            desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
+            desc_used[:, 9] = desc_adapted[0, :, 2]   # joint_range1
+            desc_used[:, 10] = desc_adapted[0, :, 3]  # joint_range2
+            gps_used[..., -1] = pol_adapted[0, 0]     # mass
 
             if self.verbose and (not self._printed_active):
-                print("[ADAPTATION] active (injecting joint_range + mass_desc + mass_gps)")
+                print("[ADAPTATION] active (injecting desc[6,7,9,10] + mass)")
                 self._printed_active = True
 
         # Run policy
@@ -483,14 +451,14 @@ class RobotHandler(Node):
         self.urma_runner = DeploymentUrmaAdaptationRunner(
             policy=self.policy,
             metadata=self.metadata,
-            window_length=20,
+            window_length=10,
             adaptation_freq=1,
             enable_adaptation=True,
             verbose=True,
             device="cpu",
         )
-        # OPTIONAL: you will implement and enable this:
-        self.urma_runner.load_adaptation_checkpoint("adaptation_module/2026-01-22_16-56-48_online_urma_offline_adaptation_GenBot1K-adp-v2_training/adaptive_configure_model_epoch100.pth")
+        # Use model_explicit checkpoint (from online_urma_explicit_offline_adaptation)
+        self.urma_runner.load_adaptation_checkpoint("adaptation_module/2026-02-21_17-01-32_online_urma_explicit_offline_adaptation_GenBot1K-adp-v3_training/explicit_v2_model_epoch85.pth")
 
         print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
 
