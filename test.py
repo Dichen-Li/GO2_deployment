@@ -22,7 +22,7 @@ YOU MUST IMPLEMENT (placeholders):
 - DeploymentAdaptationModule.load_checkpoint(...)
 - DeploymentAdaptationModule._forward_model(...)
 """
-JOINT_IDS_TO_LOCK = [3, 4, 5] # rear left
+JOINT_IDS_TO_LOCK = [3, 4, 5] # front left
 HARD_LOCKED_FACTOR = 0.3
 CMD_VEL_THRESHOLD = 0.0
 ENABLE_ADAPTATION = True
@@ -270,11 +270,11 @@ class DeploymentUrmaAdaptationRunner:
         cmd_vel = gps[3:6]  # goal velocities
         if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > CMD_VEL_THRESHOLD:
             # desc_pred[:,:,0]->index 6, [1]->7, [2]->9, [3]->10; pol_pred->gps[-1]
-            desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
-            desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
+            # desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
+            # desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
             desc_used[:, 9] = desc_adapted[0, :, 2]   # joint_range1
             desc_used[:, 10] = desc_adapted[0, :, 3]  # joint_range2
-            gps_used[..., -1] = pol_adapted[0, 0]     # mass
+            # gps_used[..., -1] = pol_adapted[0, 0]     # mass
 
             if self.verbose and (not self._printed_active):
                 print("[ADAPTATION] active (injecting desc[6,7,9,10] + mass)")
