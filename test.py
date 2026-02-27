@@ -22,6 +22,10 @@ YOU MUST IMPLEMENT (placeholders):
 - DeploymentAdaptationModule.load_checkpoint(...)
 - DeploymentAdaptationModule._forward_model(...)
 """
+JOINT_IDS_TO_LOCK = [3, 4, 5] # rear left
+HARD_LOCKED_FACTOR = 0.3
+CMD_VEL_THRESHOLD = 0.0
+ENABLE_ADAPTATION = True
 
 import os
 import time
@@ -69,16 +73,9 @@ def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metad
     trunk_angular_vel_update_obs_idx = metadata.trunk_angular_vel_update_obs_idx
     goal_velocity_update_obs_idx = metadata.goal_velocity_update_obs_idx
     projected_gravity_update_obs_idx = metadata.projected_gravity_update_obs_idx
-    # Deployment: trunk(252-254)+goal(255-257)+gravity(258-260), then gains(261-263), then mass(264)
-    variant_indices = trunk_angular_vel_update_obs_idx + goal_velocity_update_obs_idx + projected_gravity_update_obs_idx
-    mass_obs_idx = 264
-    general_policy_state = torch.cat(
-        [
-            one_policy_observation[..., variant_indices],
-            one_policy_observation[..., mass_obs_idx : mass_obs_idx + 1],
-        ],
-        dim=-1,
-    )
+    # Deployment: trunk(252-254)+goal(255-257)+gravity(258-260), then mass(261)
+    mass_idx = [projected_gravity_update_obs_idx[-1] + 1]
+    general_policy_state = one_policy_observation[..., trunk_angular_vel_update_obs_idx+goal_velocity_update_obs_idx+projected_gravity_update_obs_idx+mass_idx]
 
     return dynamic_joint_description, dynamic_joint_state, general_policy_state
 
@@ -212,7 +209,7 @@ class DeploymentUrmaAdaptationRunner:
         self,
         policy: torch.nn.Module,
         metadata: SimpleNamespace,
-        window_length: int = 20,
+        window_length: int = 10,
         adaptation_freq: int = 1,
         enable_adaptation: bool = True,
         verbose: bool = True,
@@ -236,6 +233,7 @@ class DeploymentUrmaAdaptationRunner:
 
         self._printed_active = False
         self.global_step = 0
+        self.adp_attached = False
 
     def load_adaptation_checkpoint(self, ckpt_path: str):
         if self.adaptation is None:
@@ -270,7 +268,7 @@ class DeploymentUrmaAdaptationRunner:
 
         # Inject predictions if available and conditions met (matches eval_actor_urma_adaptive)
         cmd_vel = gps[3:6]  # goal velocities
-        if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > 0.1:
+        if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > CMD_VEL_THRESHOLD:
             # desc_pred[:,:,0]->index 6, [1]->7, [2]->9, [3]->10; pol_pred->gps[-1]
             desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
             desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
@@ -281,6 +279,10 @@ class DeploymentUrmaAdaptationRunner:
             if self.verbose and (not self._printed_active):
                 print("[ADAPTATION] active (injecting desc[6,7,9,10] + mass)")
                 self._printed_active = True
+            
+            self.adp_attached = True
+        else:
+            self.adp_attached = False
 
         # Run policy
         with torch.no_grad():
@@ -309,6 +311,7 @@ class DeploymentUrmaAdaptationRunner:
             "command_velocity": cmd_vel.cpu().numpy().tolist(),
             "has_prediction": has_pred,
             "hist_idx": (self.adaptation.hist_idx if self.adaptation else None),
+            "adp_attached": self.adp_attached
         }
         self.global_step += 1
         return action, debug
@@ -393,7 +396,7 @@ class RobotHandler(Node):
         self.stand_and_lie_d_gain = 3.0
 
         self.velocity_safety_threshold = 15.0
-        self.goal_clip = 1.0
+        self.goal_clip = 0.5
 
         self.nn_p_gain = 20.0
         self.nn_d_gain = 0.5
@@ -412,10 +415,8 @@ class RobotHandler(Node):
         self.control_mode = None
 
         # --- Hard locking config (KEEP ORIGINAL) ---
-        # self.joint_ids_to_lock = []  # Put the joint ids that you want to lock here
-        # self.hard_locked_factor = 0.0
-        self.joint_ids_to_lock = [3, 4, 5] # Put the joint ids that you want to lock here
-        self.hard_locked_factor = 0.2
+        self.joint_ids_to_lock = JOINT_IDS_TO_LOCK  # Put the joint ids that you want to lock here
+        self.hard_locked_factor = HARD_LOCKED_FACTOR
         self.joint_limits = np.array([
             [-1.0472,   1.0472 ],
             [-1.5708,   3.4907 ],
@@ -445,7 +446,7 @@ class RobotHandler(Node):
         self.high_d_gain = np.ones(12) * 1.0
 
         # --- Policy load (UNCHANGED) ---
-        self.load_policy("2025-11-21_01-36-14_model_5999.pt")
+        self.load_policy("2026-02-15_17-56-39/model_11000.pt")
 
         # --- Online adaptation runner (CPU, freq=1). Model placeholders inside. ---
         self.urma_runner = DeploymentUrmaAdaptationRunner(
@@ -453,7 +454,7 @@ class RobotHandler(Node):
             metadata=self.metadata,
             window_length=10,
             adaptation_freq=1,
-            enable_adaptation=True,
+            enable_adaptation=ENABLE_ADAPTATION,
             verbose=True,
             device="cpu",
         )
@@ -628,8 +629,8 @@ class RobotHandler(Node):
                 np.array([self.desc_joint_lower_limits[i]]),
                 np.array([self.desc_joint_upper_limits[i]]),
                 ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
-                (self.desc_mass / 85.0) - 1.0,
-                (self.robot_dimensions / 1.0) - 1.0,
+                ((self.desc_mass / 85.0) - 1.0) * 0,
+                ((self.robot_dimensions / 1.0) - 1.0) * 0,
             ])
 
             current_observation = np.concatenate((
@@ -645,11 +646,7 @@ class RobotHandler(Node):
             np.clip(trunk_angular_velocity / 50.0, -10.0, 10.0),
             goal_velocities,
             projected_gravity_vector,
-            ((self.gains_and_action_scaling_factor / np.array([50.0, 1.0, 0.4])) - 1.0),
             (self.desc_mass / 85.0) - 1.0,
-            ((self.robot_dimensions / 1.0) - 1.0),
-            (self.nr_joints / 15.0 - 1.0),
-            self.scaled_foot_size
         ])
 
         return observation
@@ -733,7 +730,7 @@ class RobotHandler(Node):
         # KEEP ORIGINAL dt debug + add adaptation flags
         now = time.time()
         if hasattr(self, "last_publish_time_wall"):
-            print("dt:", now - self.last_publish_time_wall, "command velocity", debug.get("command_velocity"), "| adp:", debug.get("has_prediction"), "| hist:", debug.get("hist_idx"))
+            print("dt:", now - self.last_publish_time_wall, "command velocity", debug.get("command_velocity"), "| adp:", debug.get("adp_attached"), "| hist:", debug.get("hist_idx"))
         self.last_publish_time_wall = now
 
         self.publisher.publish(low_cmd)
