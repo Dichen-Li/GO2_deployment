@@ -26,6 +26,8 @@ JOINT_IDS_TO_LOCK = [3, 4, 5] # front left
 HARD_LOCKED_FACTOR = 0.3
 CMD_VEL_THRESHOLD = 0.0
 ENABLE_ADAPTATION = True
+CORRECT_JR_FLAG = False
+
 
 import os
 import time
@@ -240,14 +242,17 @@ class DeploymentUrmaAdaptationRunner:
             return
         self.adaptation.load_checkpoint(ckpt_path)
 
-    def step(self, one_policy_observation: torch.Tensor):
+    def step(self, one_policy_observation: torch.Tensor, correct_jr_flag: bool = False, correct_joint_lower: torch.Tensor = None, correct_joint_upper: torch.Tensor = None):
         """
         one_policy_observation: torch.float32, shape (obs_dim,)
+        correct_jr_flag: bool, whether to use correct joint range
+        correct_joint_lower: torch.float32, shape (12,), in policy order; hard lower limits for desc[:,9]
+        correct_joint_upper: torch.float32, shape (12,), in policy order; hard upper limits for desc[:,10]
         Returns:
           action: (12,) torch
           debug: dict
         """
-        one_policy_observation = one_policy_observation.to(self.device)
+        one_policy_observation = one_policy_observation.to(self.device)    
 
         # Parse observation (10-element general_policy_state: trunk+goal+gravity+mass)
         desc_gt, state, gps = one_policy_observation_to_inputs(one_policy_observation, self.metadata)
@@ -269,12 +274,18 @@ class DeploymentUrmaAdaptationRunner:
         # Inject predictions if available and conditions met (matches eval_actor_urma_adaptive)
         cmd_vel = gps[3:6]  # goal velocities
         if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > CMD_VEL_THRESHOLD:
-            # desc_pred[:,:,0]->index 6, [1]->7, [2]->9, [3]->10; pol_pred->gps[-1]
-            # desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
-            # desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
-            desc_used[:, 9] = desc_adapted[0, :, 2]   # joint_range1
-            desc_used[:, 10] = desc_adapted[0, :, 3]  # joint_range2
-            # gps_used[..., -1] = pol_adapted[0, 0]     # mass
+            # desc_pred[:,:,0]->index 6, [1]->7; joint range (9,10) use correct hard limits (policy order)
+            desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
+            desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
+            if correct_jr_flag:
+                correct_joint_lower = torch.as_tensor(correct_joint_lower, dtype=torch.float32, device=self.device)
+                correct_joint_upper = torch.as_tensor(correct_joint_upper, dtype=torch.float32, device=self.device)
+                desc_used[:, 9] = correct_joint_lower
+                desc_used[:, 10] = correct_joint_upper
+            else:
+                desc_used[:, 9] = desc_adapted[0, :, 2]
+                desc_used[:, 10] = desc_adapted[0, :, 3]
+            gps_used[..., -1] = pol_adapted[0, 0]     # mass
 
             if self.verbose and (not self._printed_active):
                 print("[ADAPTATION] active (injecting desc[6,7,9,10] + mass)")
@@ -685,8 +696,12 @@ class RobotHandler(Node):
         )
         observation = torch.from_numpy(observation).float()
 
-        # NEW: runner handles (prediction->inject->action->history)
-        action_t, debug = self.urma_runner.step(observation)
+        # Correct joint range (hard limits) in policy order: policy p -> robot obs_reorder_mask[p]
+        correct_joint_lower = self.hard_joint_lower_limits[np.array(self.obs_reorder_mask)]
+        correct_joint_upper = self.hard_joint_upper_limits[np.array(self.obs_reorder_mask)]
+
+        # Runner: uses correct joint range for desc[9,10] instead of adaptation output
+        action_t, debug = self.urma_runner.step(observation, correct_jr_flag = CORRECT_JR_FLAG, correct_joint_lower=correct_joint_lower, correct_joint_upper=correct_joint_upper)
 
         # KEEP ORIGINAL downstream logic: reorder + convert to numpy
         action = action_t.detach().cpu().numpy()
