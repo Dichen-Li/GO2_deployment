@@ -491,6 +491,40 @@ class DeploymentAdaptationLogger:
 
 
 # -------------------------
+# Joint position logger (for visualize_joint_position.py)
+# -------------------------
+class JointPositionLogger:
+    """Logs joint positions per timestep (policy order)."""
+
+    def __init__(self, num_joints: int = 12):
+        self.num_joints = num_joints
+        self.log = {"timesteps": [], "joint_position": []}
+
+    def reset(self):
+        """Start fresh log (call when entering nn mode)."""
+        self.log = {"timesteps": [], "joint_position": []}
+
+    def log_timestep(self, timestep: int, joint_position):
+        """Append one timestep. joint_position: (12,) in policy order."""
+        self.log["timesteps"].append(timestep)
+        self.log["joint_position"].append(np.asarray(joint_position).tolist())
+
+    def save_to_json(self, filepath: str):
+        """Save to JSON."""
+        data = {
+            **self.log,
+            "num_joints": self.num_joints,
+            "description": "Joint positions (rad) in policy order: hip(fl,fr,rl,rr), thigh(fl,fr,rl,rr), knee(fl,fr,rl,rr)",
+        }
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[INFO] Logged {len(self.log['timesteps'])} timesteps to {filepath}")
+
+
+# -------------------------
 # RobotHandler (deployment)
 # -------------------------
 class RobotHandler(Node):
@@ -648,7 +682,9 @@ class RobotHandler(Node):
 
         # --- Adaptation logger (start fresh on nn enter, save on nn exit) ---
         self.adaptation_logger = DeploymentAdaptationLogger(num_joints=12)
+        self.joint_position_logger = JointPositionLogger(num_joints=12)
         self.adaptation_log_dir = os.path.join(os.path.dirname(__file__), "adaptation_logs")
+        self.joint_position_log_dir = os.path.join(os.path.dirname(__file__), "joint_position_logs")
 
         print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
 
@@ -667,16 +703,20 @@ class RobotHandler(Node):
             self.locking_active = False
             self._apply_active_hard_limits()
             self.adaptation_logger.reset()
+            self.joint_position_logger.reset()
             print("[LOG] Started fresh adaptation log (nn mode entered)")
-        # Exiting nn to stand_up/lie_down/stop: save log
+        # Exiting nn to stand_up/lie_down/stop: save logs (same timestamp, in timestamp subfolders)
         elif prev == "nn" and control_mode in ("stand_up", "lie_down", "stop"):
             if len(self.adaptation_logger.log["timesteps"]) > 0:
                 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                log_path = os.path.join(
-                    self.adaptation_log_dir,
-                    f"adaptation_log_{stamp}.json",
+                adaptation_stamp_dir = os.path.join(self.adaptation_log_dir, stamp)
+                joint_position_stamp_dir = os.path.join(self.joint_position_log_dir, stamp)
+                self.adaptation_logger.save_to_json(
+                    os.path.join(adaptation_stamp_dir, "adaptation_log.json")
                 )
-                self.adaptation_logger.save_to_json(log_path)
+                self.joint_position_logger.save_to_json(
+                    os.path.join(joint_position_stamp_dir, "joint_position_log.json")
+                )
             else:
                 print("[LOG] No timesteps logged, skipping save")
 
@@ -928,6 +968,13 @@ class RobotHandler(Node):
             correct_joint_upper=correct_joint_upper,
             correct_mass_flag=CORRECT_MASS_FLAG,
             correct_mass=correct_mass,
+        )
+
+        # Log joint positions (policy order)
+        joint_pos_policy_order = self.joint_positions[np.array(self.obs_reorder_mask)]
+        self.joint_position_logger.log_timestep(
+            timestep=debug["step"],
+            joint_position=joint_pos_policy_order,
         )
 
         # Log adaptation data (for visualize_predictions.py)
