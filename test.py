@@ -40,6 +40,7 @@ CORRECT_MASS_FLAG = False
 
 import json
 import os
+import shutil
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -719,6 +720,12 @@ class RobotHandler(Node):
                 self.joint_position_logger.save_to_json(
                     os.path.join(joint_position_dir, "joint_position_log.json")
                 )
+                # Store raw deployment code snapshot
+                shutil.copy(
+                    __file__,
+                    os.path.join(timestamp_dir, "deployment_code.py"),
+                )
+                print(f"[INFO] Saved deployment code to {timestamp_dir}/deployment_code.py")
             else:
                 print("[LOG] No timesteps logged, skipping save")
 
