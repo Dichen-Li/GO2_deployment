@@ -22,11 +22,20 @@ YOU MUST IMPLEMENT (placeholders):
 - DeploymentAdaptationModule.load_checkpoint(...)
 - DeploymentAdaptationModule._forward_model(...)
 """
+# MACRO DEFINITIO FOR DEPLOYMENT
 JOINT_IDS_TO_LOCK = [3, 4, 5] # front left
 HARD_LOCKED_FACTOR = 0.3
+ADDED_MASS = 0
 CMD_VEL_THRESHOLD = 0.0
+"""
+ENABLE_ADAPTATION = False                             -> default(blind)
+ENABLE_ADAPTATION = True and CORRECT_..._FLAG = False -> adaptation
+ENABLE_ADAPTATION = True and CORRECT_..._FLAG = True  -> correct(privilege)
+"""
 ENABLE_ADAPTATION = True
 CORRECT_JR_FLAG = False
+CORRECT_MASS_FLAG = False
+
 
 
 import os
@@ -53,8 +62,8 @@ from policy import get_policy
 
 # -------------------------
 # Deployment observation parser (standalone, matches simulation output format)
-# Deployment obs: 272 elements. general_policy_state = trunk(3)+goal(3)+gravity(3)+mass(1) = 10 elements.
-# Mass is at index 264 (gains 261-263 sit between gravity and mass).
+# Deployment obs: 262 elements. general_policy_state = trunk(3)+goal(3)+gravity(3)+mass(1) = 10 elements.
+# Mass is at index 261 (indices 252-261 = trunk, goal, gravity, mass).
 # -------------------------
 def one_policy_observation_to_inputs(one_policy_observation: torch.Tensor, metadata: SimpleNamespace):
     """
@@ -235,14 +244,20 @@ class DeploymentUrmaAdaptationRunner:
 
         self._printed_active = False
         self.global_step = 0
-        self.adp_attached = False
+        self.adp_jr = "default"
+        self.adp_mass = "default"
 
     def load_adaptation_checkpoint(self, ckpt_path: str):
         if self.adaptation is None:
             return
         self.adaptation.load_checkpoint(ckpt_path)
 
-    def step(self, one_policy_observation: torch.Tensor, correct_jr_flag: bool = False, correct_joint_lower: torch.Tensor = None, correct_joint_upper: torch.Tensor = None):
+    def step(self, one_policy_observation: torch.Tensor, 
+             correct_jr_flag: bool = False, 
+             correct_joint_lower: torch.Tensor = None, 
+             correct_joint_upper: torch.Tensor = None, 
+             correct_mass_flag: bool = False, 
+             correct_mass: torch.Tensor = None):
         """
         one_policy_observation: torch.float32, shape (obs_dim,)
         correct_jr_flag: bool, whether to use correct joint range
@@ -277,23 +292,32 @@ class DeploymentUrmaAdaptationRunner:
             # desc_pred[:,:,0]->index 6, [1]->7; joint range (9,10) use correct hard limits (policy order)
             desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
             desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
-            if correct_jr_flag:
+            
+            if correct_jr_flag and correct_joint_lower is not None and correct_joint_upper is not None:
                 correct_joint_lower = torch.as_tensor(correct_joint_lower, dtype=torch.float32, device=self.device)
                 correct_joint_upper = torch.as_tensor(correct_joint_upper, dtype=torch.float32, device=self.device)
                 desc_used[:, 9] = correct_joint_lower
                 desc_used[:, 10] = correct_joint_upper
+                self.adp_jr = "correct"
             else:
                 desc_used[:, 9] = desc_adapted[0, :, 2]
                 desc_used[:, 10] = desc_adapted[0, :, 3]
-            gps_used[..., -1] = pol_adapted[0, 0]     # mass
-
+                self.adp_jr = "adaptation"
+            
+            if correct_mass_flag and correct_mass is not None:
+                correct_mass = torch.as_tensor(correct_mass, dtype=torch.float32, device=self.device)
+                gps_used[..., -1] = correct_mass
+                self.adp_mass = "correct"
+            else:
+                gps_used[..., -1] = pol_adapted[0, 0]     # mass
+                self.adp_mass = "adaptation"
+            
             if self.verbose and (not self._printed_active):
                 print("[ADAPTATION] active (injecting desc[6,7,9,10] + mass)")
                 self._printed_active = True
-            
-            self.adp_attached = True
         else:
-            self.adp_attached = False
+            self.adp_jr = "default"
+            self.adp_mass = "default"
 
         # Run policy
         with torch.no_grad():
@@ -322,7 +346,8 @@ class DeploymentUrmaAdaptationRunner:
             "command_velocity": cmd_vel.cpu().numpy().tolist(),
             "has_prediction": has_pred,
             "hist_idx": (self.adaptation.hist_idx if self.adaptation else None),
-            "adp_attached": self.adp_attached
+            "adp_jr": self.adp_jr,
+            "adp_mass": self.adp_mass
         }
         self.global_step += 1
         return action, debug
@@ -388,11 +413,12 @@ class RobotHandler(Node):
 
         self.control_frequency = 50.0
 
+        # Policy-side nominal in robot order (fr,fl,rr,rl)
         self.nominal_joint_positions = np.array([
-            0.0, 0.8, -1.5,
-            0.0, 0.8, -1.5,
-            0.0, 1.0, -1.5,
-            0.0, 1.0, -1.5
+            -0.1, 0.8, -1.5,
+            0.1, 0.8, -1.5,
+            -0.1, 1.0, -1.5,
+            0.1, 1.0, -1.5
         ])
 
         self.lying_joint_positions = np.array([
@@ -425,22 +451,22 @@ class RobotHandler(Node):
         self.last_seen_control_mode = None
         self.control_mode = None
 
-        # --- Hard locking config (KEEP ORIGINAL) ---
-        self.joint_ids_to_lock = JOINT_IDS_TO_LOCK  # Put the joint ids that you want to lock here
+        # --- Hard locking config: policy-side joint range in robot order ---
+        self.joint_ids_to_lock = JOINT_IDS_TO_LOCK
         self.hard_locked_factor = HARD_LOCKED_FACTOR
         self.joint_limits = np.array([
-            [-1.0472,   1.0472 ],
-            [-1.5708,   3.4907 ],
-            [-2.7227,  -0.83776],
-            [-1.0472,   1.0472 ],
-            [-1.5708,   3.4907 ],
-            [-2.7227,  -0.83776],
-            [-1.0472,   1.0472 ],
-            [-0.5236,   4.5379 ],
-            [-2.7227,  -0.83776],
-            [-1.0472,   1.0472 ],
-            [-0.5236,   4.5379 ],
-            [-2.7227,  -0.83776],
+            [-1.05,  1.05 ],
+            [-1.57,  3.49 ],
+            [-2.72, -0.84 ],
+            [-1.05,  1.05 ],
+            [-1.57,  3.49 ],
+            [-2.72, -0.84 ],
+            [-1.05,  1.05 ],
+            [-0.52,  4.53 ],
+            [-2.72, -0.84 ],
+            [-1.05,  1.05 ],
+            [-0.52,  4.53 ],
+            [-2.72, -0.84 ],
         ])
 
         self.hard_joint_lower_limits = self.joint_limits[:, 0]
@@ -699,9 +725,10 @@ class RobotHandler(Node):
         # Correct joint range (hard limits) in policy order: policy p -> robot obs_reorder_mask[p]
         correct_joint_lower = self.hard_joint_lower_limits[np.array(self.obs_reorder_mask)]
         correct_joint_upper = self.hard_joint_upper_limits[np.array(self.obs_reorder_mask)]
+        correct_mass = ((self.desc_mass + ADDED_MASS) / 85.0) - 1.0
 
         # Runner: uses correct joint range for desc[9,10] instead of adaptation output
-        action_t, debug = self.urma_runner.step(observation, correct_jr_flag = CORRECT_JR_FLAG, correct_joint_lower=correct_joint_lower, correct_joint_upper=correct_joint_upper)
+        action_t, debug = self.urma_runner.step(observation, correct_jr_flag = CORRECT_JR_FLAG, correct_joint_lower=correct_joint_lower, correct_joint_upper=correct_joint_upper, correct_mass_flag=CORRECT_MASS_FLAG, correct_mass=correct_mass)
 
         # KEEP ORIGINAL downstream logic: reorder + convert to numpy
         action = action_t.detach().cpu().numpy()
@@ -745,7 +772,14 @@ class RobotHandler(Node):
         # KEEP ORIGINAL dt debug + add adaptation flags
         now = time.time()
         if hasattr(self, "last_publish_time_wall"):
-            print("dt:", now - self.last_publish_time_wall, "command velocity", debug.get("command_velocity"), "| adp:", debug.get("adp_attached"), "| hist:", debug.get("hist_idx"))
+            cv = debug.get("command_velocity") or [0, 0, 0]
+            cv_str = ", ".join(f"{v:.2f}" for v in cv[:3])
+            print("dt:", f"{now - self.last_publish_time_wall:.3f}", 
+                  "| command velocity", f"[{cv_str}]",
+                  "| hist:", debug.get("hist_idx"), 
+                  "| adp_jr:", debug.get("adp_jr"), 
+                  "| adp_mass:", debug.get("adp_mass")
+                  )
         self.last_publish_time_wall = now
 
         self.publisher.publish(low_cmd)
