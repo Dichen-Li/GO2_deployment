@@ -963,7 +963,7 @@ class RobotHandler(Node):
         # Runner: always use correct joint range (physical limits for current mode)
         action_t, debug = self.urma_runner.step(
             observation,
-            correct_jr_flag=True,
+            correct_jr_flag=CORRECT_JR_FLAG,
             correct_joint_lower=correct_joint_lower,
             correct_joint_upper=correct_joint_upper,
             correct_mass_flag=CORRECT_MASS_FLAG,
