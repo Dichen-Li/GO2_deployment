@@ -38,9 +38,11 @@ CORRECT_MASS_FLAG = False
 
 
 
+import json
 import os
 import time
 from copy import deepcopy
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -263,9 +265,10 @@ class DeploymentUrmaAdaptationRunner:
         correct_jr_flag: bool, whether to use correct joint range
         correct_joint_lower: torch.float32, shape (12,), in policy order; hard lower limits for desc[:,9]
         correct_joint_upper: torch.float32, shape (12,), in policy order; hard upper limits for desc[:,10]
+        correct_mass: normalized ground truth mass, ((mass_kg)/85)-1; used for policy and for logging gt_mass
         Returns:
           action: (12,) torch
-          debug: dict
+          debug: dict (includes log values for DeploymentAdaptationLogger)
         """
         one_policy_observation = one_policy_observation.to(self.device)    
 
@@ -341,16 +344,150 @@ class DeploymentUrmaAdaptationRunner:
             if self.verbose and (not self.adaptation.has_prediction):
                 print(f"[ADAPTATION] warming up: hist={self.adaptation.hist_idx}/{self.adaptation.W}")
 
+        # Log values for DeploymentAdaptationLogger
+        # Target shapes for visualize_predictions.py: (1, 12, 2) for joint range, (1, 1) for mass
+        # Deployment: desc_gt/desc_used are (12, 18), desc_adapted is (1, 12, 4), gps is (10,)
+        def _mass_denorm(x):
+            return (torch.as_tensor(x, device=self.device) + 1) * 85
+
+        def _to_log_jr(x):
+            """Ensure (1, 12, 2) for joint range log."""
+            t = torch.as_tensor(x, device=self.device) if not isinstance(x, torch.Tensor) else x.to(self.device)
+            if t.dim() == 2:
+                t = t.unsqueeze(0)
+            return t
+
+        def _to_log_mass(x):
+            """Ensure (1, 1) for mass log."""
+            t = torch.as_tensor(x, device=self.device) if not isinstance(x, torch.Tensor) else x.to(self.device)
+            return t.reshape(1, 1) if t.dim() <= 1 else t
+
+        # Ground truth joint range (1, 12, 2)
+        if correct_joint_lower is not None and correct_joint_upper is not None:
+            gt_jr = torch.stack([
+                torch.as_tensor(correct_joint_lower, device=self.device),
+                torch.as_tensor(correct_joint_upper, device=self.device),
+            ], dim=-1)
+        else:
+            gt_jr = desc_gt[:, 9:11] if desc_gt.dim() == 2 else desc_gt[:, :, 9:11]
+        gt_jr = _to_log_jr(gt_jr)
+
+        # Adapted joint range (1, 12, 2)
+        adapted_jr = desc_adapted[:, :, 2:4]
+
+        # Used-in-policy joint range (1, 12, 2)
+        used_jr = desc_used[:, 9:11] if desc_used.dim() == 2 else desc_used[:, :, 9:11]
+        used_jr = _to_log_jr(used_jr)
+
+        # Mass values (1, 1) each
+        gt_mass = _to_log_mass(_mass_denorm(correct_mass)) if correct_mass is not None else torch.tensor([[85.0]], device=self.device)
+        adapted_mass = _to_log_mass(_mass_denorm(pol_adapted[0, 0]))
+        used_mass = _to_log_mass(_mass_denorm(gps_used[..., -1]))
+
         debug = {
             "step": self.global_step,
             "command_velocity": cmd_vel.cpu().numpy().tolist(),
             "has_prediction": has_pred,
             "hist_idx": (self.adaptation.hist_idx if self.adaptation else None),
             "adp_jr": self.adp_jr,
-            "adp_mass": self.adp_mass
+            "adp_mass": self.adp_mass,
+            "log": {
+                "ground_truth_joint_range": gt_jr,
+                "adapted_joint_range": adapted_jr,
+                "used_in_policy_joint_range": used_jr,
+                "ground_truth_mass": gt_mass,
+                "adapted_mass": adapted_mass,
+                "used_in_policy_mass": used_mass,
+                "has_adaptation": has_pred,
+            },
         }
         self.global_step += 1
         return action, debug
+
+
+# -------------------------
+# Deployment adaptation logger (JSON format matching eval_actor_urma_adaptive)
+# -------------------------
+class DeploymentAdaptationLogger:
+    """Logs ground truth, adapted, and used-in-policy values for visualize_predictions.py."""
+
+    def __init__(self, num_joints: int = 12):
+        self.num_joints = num_joints
+        self.log = {
+            "timesteps": [],
+            "ground_truth_joint_range": [],
+            "adapted_joint_range": [],
+            "used_in_policy_joint_range": [],
+            "ground_truth_mass": [],
+            "adapted_mass": [],
+            "used_in_policy_mass": [],
+            "has_adaptation": [],
+        }
+
+    def reset(self):
+        """Start fresh log (call when entering nn mode)."""
+        self.log = {
+            "timesteps": [],
+            "ground_truth_joint_range": [],
+            "adapted_joint_range": [],
+            "used_in_policy_joint_range": [],
+            "ground_truth_mass": [],
+            "adapted_mass": [],
+            "used_in_policy_mass": [],
+            "has_adaptation": [],
+        }
+
+    def log_timestep(
+        self,
+        timestep: int,
+        ground_truth_joint_range,
+        adapted_joint_range,
+        used_in_policy_joint_range,
+        ground_truth_mass,
+        adapted_mass,
+        used_in_policy_mass,
+        has_adaptation: bool,
+    ):
+        """Append one timestep. All tensors/arrays in policy order, shapes (1,12,2) or (1,1) for mass."""
+        self.log["timesteps"].append(timestep)
+        self.log["ground_truth_joint_range"].append(
+            np.asarray(ground_truth_joint_range).tolist()
+        )
+        self.log["adapted_joint_range"].append(
+            np.asarray(adapted_joint_range).tolist()
+        )
+        self.log["used_in_policy_joint_range"].append(
+            np.asarray(used_in_policy_joint_range).tolist()
+        )
+        self.log["ground_truth_mass"].append(
+            np.asarray(ground_truth_mass).tolist()
+        )
+        self.log["adapted_mass"].append(np.asarray(adapted_mass).tolist())
+        self.log["used_in_policy_mass"].append(
+            np.asarray(used_in_policy_mass).tolist()
+        )
+        # Shape (num_envs,) for visualize_predictions: [[True], [True], ...] -> (T, 1)
+        self.log["has_adaptation"].append([has_adaptation])
+
+    def save_to_json(self, filepath: str):
+        """Save to JSON (compatible with visualize_predictions.py)."""
+        data = {
+            **self.log,
+            "num_envs": 1,
+            "num_joints": self.num_joints,
+            "description": {
+                "ground_truth": "Real physical properties (hard_joint_limits)",
+                "adapted": "Predictions from adaptation module",
+                "used_in_policy": "Values in policy observation",
+                "has_adaptation": "True if robot has valid prediction",
+            },
+        }
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[INFO] Logged {len(self.log['timesteps'])} timesteps to {filepath}")
 
 
 # -------------------------
@@ -451,7 +588,8 @@ class RobotHandler(Node):
         self.last_seen_control_mode = None
         self.control_mode = None
 
-        # --- Hard locking config: policy-side joint range in robot order ---
+        # --- On-the-fly locking: default vs locking condition ---
+        self.locking_active = False  # Always False when entering nn; button 2 toggles to True
         self.joint_ids_to_lock = JOINT_IDS_TO_LOCK
         self.hard_locked_factor = HARD_LOCKED_FACTOR
         self.joint_limits = np.array([
@@ -469,15 +607,25 @@ class RobotHandler(Node):
             [-2.72, -0.84 ],
         ])
 
-        self.hard_joint_lower_limits = self.joint_limits[:, 0]
-        self.hard_joint_lower_limits[self.joint_ids_to_lock] = \
-            self.hard_locked_factor * self.hard_joint_lower_limits[self.joint_ids_to_lock] + \
-            (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        # Default: full joint range (no locking)
+        self.default_hard_joint_lower_limits = self.joint_limits[:, 0].copy()
+        self.default_hard_joint_upper_limits = self.joint_limits[:, 1].copy()
 
-        self.hard_joint_upper_limits = self.joint_limits[:, 1]
-        self.hard_joint_upper_limits[self.joint_ids_to_lock] = \
-            self.hard_locked_factor * self.hard_joint_upper_limits[self.joint_ids_to_lock] + \
-            (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        # Locking: narrowed range for JOINT_IDS_TO_LOCK
+        self.locked_hard_joint_lower_limits = self.joint_limits[:, 0].copy()
+        self.locked_hard_joint_lower_limits[self.joint_ids_to_lock] = (
+            self.hard_locked_factor * self.joint_limits[self.joint_ids_to_lock, 0]
+            + (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        )
+        self.locked_hard_joint_upper_limits = self.joint_limits[:, 1].copy()
+        self.locked_hard_joint_upper_limits[self.joint_ids_to_lock] = (
+            self.hard_locked_factor * self.joint_limits[self.joint_ids_to_lock, 1]
+            + (1 - self.hard_locked_factor) * self.nominal_joint_positions[self.joint_ids_to_lock]
+        )
+
+        # Active limits (selected by locking_active)
+        self.hard_joint_lower_limits = self.default_hard_joint_lower_limits.copy()
+        self.hard_joint_upper_limits = self.default_hard_joint_upper_limits.copy()
 
         self.high_p_gain = np.ones(12) * 60.0
         self.high_d_gain = np.ones(12) * 1.0
@@ -498,6 +646,10 @@ class RobotHandler(Node):
         # Use model_explicit checkpoint (from online_urma_explicit_offline_adaptation)
         self.urma_runner.load_adaptation_checkpoint("adaptation_module/2026-02-21_17-01-32_online_urma_explicit_offline_adaptation_GenBot1K-adp-v3_training/explicit_v2_model_epoch85.pth")
 
+        # --- Adaptation logger (start fresh on nn enter, save on nn exit) ---
+        self.adaptation_logger = DeploymentAdaptationLogger(num_joints=12)
+        self.adaptation_log_dir = os.path.join(os.path.dirname(__file__), "adaptation_logs")
+
         print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
 
         self.timer = self.create_timer(1 / self.control_frequency, self.timer_callback)
@@ -506,9 +658,38 @@ class RobotHandler(Node):
     # ROS callbacks
     # ----------------
     def switch_control_mode(self, control_mode):
-        self.previous_control_mode = self.control_mode if self.control_mode != control_mode else self.previous_control_mode
+        prev = self.control_mode
+        self.previous_control_mode = prev if self.control_mode != control_mode else self.previous_control_mode
         self.control_mode = control_mode
+
+        # Entering nn: start fresh log, always default (no locking)
+        if control_mode == "nn":
+            self.locking_active = False
+            self._apply_active_hard_limits()
+            self.adaptation_logger.reset()
+            print("[LOG] Started fresh adaptation log (nn mode entered)")
+        # Exiting nn to stand_up/lie_down/stop: save log
+        elif prev == "nn" and control_mode in ("stand_up", "lie_down", "stop"):
+            if len(self.adaptation_logger.log["timesteps"]) > 0:
+                stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                log_path = os.path.join(
+                    self.adaptation_log_dir,
+                    f"adaptation_log_{stamp}.json",
+                )
+                self.adaptation_logger.save_to_json(log_path)
+            else:
+                print("[LOG] No timesteps logged, skipping save")
+
         print(f"Switched to control mode: {self.control_mode}")
+
+    def _apply_active_hard_limits(self):
+        """Update hard_joint_lower/upper_limits from locking_active."""
+        if self.locking_active:
+            self.hard_joint_lower_limits[:] = self.locked_hard_joint_lower_limits
+            self.hard_joint_upper_limits[:] = self.locked_hard_joint_upper_limits
+        else:
+            self.hard_joint_lower_limits[:] = self.default_hard_joint_lower_limits
+            self.hard_joint_upper_limits[:] = self.default_hard_joint_upper_limits
 
     def low_state_callback(self, msg):
         motor_states = msg.motor_state
@@ -535,6 +716,17 @@ class RobotHandler(Node):
             self.switch_control_mode("nn")
         elif msg.keys == 256:
             self.switch_control_mode("stop")
+        # On-the-fly locking: 1=default, 2=locking (no-op if already in that state)
+        elif msg.keys == 1:
+            if self.locking_active:
+                self.locking_active = False
+                self._apply_active_hard_limits()
+                print("[LOCKING] Switched to default (full joint range)")
+        elif msg.keys == 2:
+            if not self.locking_active:
+                self.locking_active = True
+                self._apply_active_hard_limits()
+                print("[LOCKING] Switched to locking condition")
 
     # ----------------
     # Main loop
@@ -723,12 +915,34 @@ class RobotHandler(Node):
         observation = torch.from_numpy(observation).float()
 
         # Correct joint range (hard limits) in policy order: policy p -> robot obs_reorder_mask[p]
+        # When locking_active: use locked limits; otherwise use default limits
         correct_joint_lower = self.hard_joint_lower_limits[np.array(self.obs_reorder_mask)]
         correct_joint_upper = self.hard_joint_upper_limits[np.array(self.obs_reorder_mask)]
         correct_mass = ((self.desc_mass + ADDED_MASS) / 85.0) - 1.0
 
-        # Runner: uses correct joint range for desc[9,10] instead of adaptation output
-        action_t, debug = self.urma_runner.step(observation, correct_jr_flag = CORRECT_JR_FLAG, correct_joint_lower=correct_joint_lower, correct_joint_upper=correct_joint_upper, correct_mass_flag=CORRECT_MASS_FLAG, correct_mass=correct_mass)
+        # Runner: always use correct joint range (physical limits for current mode)
+        action_t, debug = self.urma_runner.step(
+            observation,
+            correct_jr_flag=True,
+            correct_joint_lower=correct_joint_lower,
+            correct_joint_upper=correct_joint_upper,
+            correct_mass_flag=CORRECT_MASS_FLAG,
+            correct_mass=correct_mass,
+        )
+
+        # Log adaptation data (for visualize_predictions.py)
+        log_data = debug.get("log")
+        if log_data:
+            self.adaptation_logger.log_timestep(
+                timestep=debug["step"],
+                ground_truth_joint_range=log_data["ground_truth_joint_range"].cpu().numpy(),
+                adapted_joint_range=log_data["adapted_joint_range"].cpu().numpy(),
+                used_in_policy_joint_range=log_data["used_in_policy_joint_range"].cpu().numpy(),
+                ground_truth_mass=log_data["ground_truth_mass"].cpu().numpy(),
+                adapted_mass=log_data["adapted_mass"].cpu().numpy(),
+                used_in_policy_mass=log_data["used_in_policy_mass"].cpu().numpy(),
+                has_adaptation=log_data["has_adaptation"],
+            )
 
         # KEEP ORIGINAL downstream logic: reorder + convert to numpy
         action = action_t.detach().cpu().numpy()
