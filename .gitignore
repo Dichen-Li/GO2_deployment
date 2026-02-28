@@ -1,5 +1,4 @@
 adaptation_module/
 policies/
 __pycache__/
-adaptation_logs/
-joint_position_logs/
+logging/

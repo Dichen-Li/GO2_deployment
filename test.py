@@ -683,8 +683,8 @@ class RobotHandler(Node):
         # --- Adaptation logger (start fresh on nn enter, save on nn exit) ---
         self.adaptation_logger = DeploymentAdaptationLogger(num_joints=12)
         self.joint_position_logger = JointPositionLogger(num_joints=12)
-        self.adaptation_log_dir = os.path.join(os.path.dirname(__file__), "adaptation_logs")
-        self.joint_position_log_dir = os.path.join(os.path.dirname(__file__), "joint_position_logs")
+        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/
+        self.logging_base_dir = os.path.join(os.path.dirname(__file__), "logging")
 
         print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
 
@@ -705,17 +705,19 @@ class RobotHandler(Node):
             self.adaptation_logger.reset()
             self.joint_position_logger.reset()
             print("[LOG] Started fresh adaptation log (nn mode entered)")
-        # Exiting nn to stand_up/lie_down/stop: save logs (same timestamp, in timestamp subfolders)
+        # Exiting nn to stand_up/lie_down/stop: save logs
+        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/
         elif prev == "nn" and control_mode in ("stand_up", "lie_down", "stop"):
             if len(self.adaptation_logger.log["timesteps"]) > 0:
                 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                adaptation_stamp_dir = os.path.join(self.adaptation_log_dir, stamp)
-                joint_position_stamp_dir = os.path.join(self.joint_position_log_dir, stamp)
+                timestamp_dir = os.path.join(self.logging_base_dir, stamp)
+                adaptation_dir = os.path.join(timestamp_dir, "adaptation_logs")
+                joint_position_dir = os.path.join(timestamp_dir, "joint_position_logs")
                 self.adaptation_logger.save_to_json(
-                    os.path.join(adaptation_stamp_dir, "adaptation_log.json")
+                    os.path.join(adaptation_dir, "adaptation_log.json")
                 )
                 self.joint_position_logger.save_to_json(
-                    os.path.join(joint_position_stamp_dir, "joint_position_log.json")
+                    os.path.join(joint_position_dir, "joint_position_log.json")
                 )
             else:
                 print("[LOG] No timesteps logged, skipping save")
