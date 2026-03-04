@@ -526,6 +526,75 @@ class JointPositionLogger:
 
 
 # -------------------------
+# Raw robot data logger (IMU, foot force, battery SOC)
+# -------------------------
+class RawRobotDataLogger:
+    """Logs raw robot sensor data per timestep: IMU (quat, rpy, gyro, acc), foot force, battery SOC."""
+
+    def __init__(self):
+        self.log = {
+            "timesteps": [],
+            "imu_quaternion": [],
+            "imu_rpy": [],
+            "imu_gyroscope": [],
+            "imu_accelerometer": [],
+            "foot_force": [],
+            "bms_soc": [],
+        }
+
+    def reset(self):
+        """Start fresh log (call when entering nn mode)."""
+        self.log = {
+            "timesteps": [],
+            "imu_quaternion": [],
+            "imu_rpy": [],
+            "imu_gyroscope": [],
+            "imu_accelerometer": [],
+            "foot_force": [],
+            "bms_soc": [],
+        }
+
+    def log_timestep(
+        self,
+        timestep: int,
+        imu_quaternion,
+        imu_rpy,
+        imu_gyroscope,
+        imu_accelerometer,
+        foot_force,
+        bms_soc: float,
+    ):
+        """Append one timestep."""
+        self.log["timesteps"].append(timestep)
+        self.log["imu_quaternion"].append(np.asarray(imu_quaternion).tolist())
+        self.log["imu_rpy"].append(np.asarray(imu_rpy).tolist())
+        self.log["imu_gyroscope"].append(np.asarray(imu_gyroscope).tolist())
+        self.log["imu_accelerometer"].append(np.asarray(imu_accelerometer).tolist())
+        self.log["foot_force"].append(np.asarray(foot_force).tolist())
+        self.log["bms_soc"].append(float(bms_soc))
+
+    def save_to_json(self, filepath: str):
+        """Save to JSON."""
+        data = {
+            **self.log,
+            "description": {
+                "imu_quaternion": "Body orientation (x,y,z,w) scipy convention, same as orientation",
+                "imu_rpy": "Euler angles (roll,pitch,yaw) rad",
+                "imu_gyroscope": "Angular velocity (x,y,z) rad/s",
+                "imu_accelerometer": "Acceleration (x,y,z) m/s^2",
+                "foot_force": "Force per foot [fl, fr, rl, rr]",
+                "bms_soc": "Battery level 1-100%",
+            },
+        }
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[INFO] Logged {len(self.log['timesteps'])} timesteps to {filepath}")
+
+
+# -------------------------
 # RobotHandler (deployment)
 # -------------------------
 class RobotHandler(Node):
@@ -582,6 +651,13 @@ class RobotHandler(Node):
         self.joint_velocities = np.zeros(12)
         self.orientation = np.array([0.0, 0.0, 0.0, 1.0])
         self.angular_velocity = np.zeros(3)
+        # Raw robot data for RawRobotDataLogger (updated in low_state_callback)
+        # orientation is used for imu_quaternion (same data, [x,y,z,w] scipy convention)
+        self.imu_rpy = np.zeros(3)
+        self.imu_gyroscope = np.zeros(3)
+        self.imu_accelerometer = np.zeros(3)
+        self.foot_force = np.zeros(4)
+        self.bms_soc = 0.0
 
         self.control_frequency = 50.0
 
@@ -684,7 +760,8 @@ class RobotHandler(Node):
         # --- Adaptation logger (start fresh on nn enter, save on nn exit) ---
         self.adaptation_logger = DeploymentAdaptationLogger(num_joints=12)
         self.joint_position_logger = JointPositionLogger(num_joints=12)
-        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/
+        self.raw_robot_logger = RawRobotDataLogger()
+        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/, logging/timestamp/raw_robot_logs/
         self.logging_base_dir = os.path.join(os.path.dirname(__file__), "logging")
 
         print("Robot ready. Expert policy + online adaptation runner initialized (CPU).")
@@ -705,20 +782,25 @@ class RobotHandler(Node):
             self._apply_active_hard_limits()
             self.adaptation_logger.reset()
             self.joint_position_logger.reset()
+            self.raw_robot_logger.reset()
             print("[LOG] Started fresh adaptation log (nn mode entered)")
         # Exiting nn to stand_up/lie_down/stop: save logs
-        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/
+        # Structure: logging/timestamp/adaptation_logs/, logging/timestamp/joint_position_logs/, logging/timestamp/raw_robot_logs/
         elif prev == "nn" and control_mode in ("stand_up", "lie_down", "stop"):
             if len(self.adaptation_logger.log["timesteps"]) > 0:
                 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 timestamp_dir = os.path.join(self.logging_base_dir, stamp)
                 adaptation_dir = os.path.join(timestamp_dir, "adaptation_logs")
                 joint_position_dir = os.path.join(timestamp_dir, "joint_position_logs")
+                raw_robot_dir = os.path.join(timestamp_dir, "raw_robot_logs")
                 self.adaptation_logger.save_to_json(
                     os.path.join(adaptation_dir, "adaptation_log.json")
                 )
                 self.joint_position_logger.save_to_json(
                     os.path.join(joint_position_dir, "joint_position_log.json")
+                )
+                self.raw_robot_logger.save_to_json(
+                    os.path.join(raw_robot_dir, "raw_robot_log.json")
                 )
                 # Store raw deployment code snapshot
                 shutil.copy(
@@ -751,6 +833,15 @@ class RobotHandler(Node):
             msg.imu_state.quaternion[0],
         ])
         self.angular_velocity = msg.imu_state.gyroscope
+        # Raw robot data for RawRobotDataLogger (orientation already set above)
+        self.imu_rpy = np.array(msg.imu_state.rpy, dtype=np.float64)
+        self.imu_gyroscope = np.array(msg.imu_state.gyroscope, dtype=np.float64)
+        self.imu_accelerometer = np.array(msg.imu_state.accelerometer, dtype=np.float64)
+        foot_force_src = getattr(msg, "foot_force", getattr(msg, "footForce", np.zeros(4)))
+        self.foot_force = np.array(foot_force_src, dtype=np.float64)
+        bms = getattr(msg, "bms_state", None)
+        if bms is not None:
+            self.bms_soc = float(getattr(bms, "soc", getattr(bms, "SOC", 0)))
 
     def joystick_callback(self, msg):
         self.x_goal_velocity = np.clip(msg.ly, -self.goal_clip, self.goal_clip)
@@ -999,6 +1090,17 @@ class RobotHandler(Node):
                 used_in_policy_mass=log_data["used_in_policy_mass"].cpu().numpy(),
                 has_adaptation=log_data["has_adaptation"],
             )
+
+        # Log raw robot data (IMU, foot force, battery SOC)
+        self.raw_robot_logger.log_timestep(
+            timestep=debug["step"],
+            imu_quaternion=self.orientation,
+            imu_rpy=self.imu_rpy,
+            imu_gyroscope=self.imu_gyroscope,
+            imu_accelerometer=self.imu_accelerometer,
+            foot_force=self.foot_force,
+            bms_soc=self.bms_soc,
+        )
 
         # KEEP ORIGINAL downstream logic: reorder + convert to numpy
         action = action_t.detach().cpu().numpy()
