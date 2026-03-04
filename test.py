@@ -294,8 +294,9 @@ class DeploymentUrmaAdaptationRunner:
         cmd_vel = gps[3:6]  # goal velocities
         if self.enable_adaptation and (self.adaptation is not None) and has_pred and cmd_vel.norm() > CMD_VEL_THRESHOLD:
             # desc_pred[:,:,0]->index 6, [1]->7; joint range (9,10) use correct hard limits (policy order)
-            desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
-            desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
+            if not correct_jo_flag:
+                desc_used[:, 6] = desc_adapted[0, :, 0]   # joint_nominal_position
+                desc_used[:, 7] = desc_adapted[0, :, 1]   # torque_limit
             
             if correct_jr_flag and correct_joint_lower is not None and correct_joint_upper is not None:
                 correct_joint_lower = torch.as_tensor(correct_joint_lower, dtype=torch.float32, device=self.device)
