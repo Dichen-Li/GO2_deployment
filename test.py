@@ -32,10 +32,10 @@ ENABLE_ADAPTATION = False                             -> default(blind)
 ENABLE_ADAPTATION = True and CORRECT_..._FLAG = False -> adaptation
 ENABLE_ADAPTATION = True and CORRECT_..._FLAG = True  -> correct(privilege)
 """
-ENABLE_ADAPTATION = False
-CORRECT_JR_FLAG = True
-CORRECT_JO_FLAG = True
-CORRECT_MASS_FLAG = True
+ENABLE_ADAPTATION = True
+CORRECT_JR_FLAG = False
+CORRECT_JO_FLAG = False
+CORRECT_MASS_FLAG = False
 
 
 
