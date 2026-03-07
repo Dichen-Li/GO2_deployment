@@ -32,9 +32,10 @@ ENABLE_ADAPTATION = False                             -> default(blind)
 ENABLE_ADAPTATION = True and CORRECT_..._FLAG = False -> adaptation
 ENABLE_ADAPTATION = True and CORRECT_..._FLAG = True  -> correct(privilege)
 """
-ENABLE_ADAPTATION = True
-CORRECT_JR_FLAG = False
-CORRECT_MASS_FLAG = False
+ENABLE_ADAPTATION = False
+CORRECT_JR_FLAG = True
+CORRECT_JO_FLAG = True
+CORRECT_MASS_FLAG = True
 
 
 
@@ -259,6 +260,7 @@ class DeploymentUrmaAdaptationRunner:
              correct_jr_flag: bool = False, 
              correct_joint_lower: torch.Tensor = None, 
              correct_joint_upper: torch.Tensor = None, 
+             correct_jo_flag: bool = False,
              correct_mass_flag: bool = False, 
              correct_mass: torch.Tensor = None):
         """
@@ -1067,6 +1069,7 @@ class RobotHandler(Node):
             correct_jr_flag=CORRECT_JR_FLAG,
             correct_joint_lower=correct_joint_lower,
             correct_joint_upper=correct_joint_upper,
+            correct_jo_flag = CORRECT_JO_FLAG,
             correct_mass_flag=CORRECT_MASS_FLAG,
             correct_mass=correct_mass,
         )
